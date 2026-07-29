@@ -34,6 +34,7 @@ Sandbox Pod
 ```bash
 # 1. Deploy OpenShell gateway (skip if Demo 2 already deployed)
 bash install.sh
+# Or with TLS: ENABLE_TLS=true bash install.sh
 
 # 2. Register gateway
 openshell gateway add http://$(oc -n openshell get route openshell-gw -o jsonpath='{.spec.host}') --local --name openshift
@@ -44,6 +45,17 @@ bash setup-sandbox.sh
 # 4. Connect
 openshell sandbox connect hermes-demo
 # Inside sandbox: hermes
+```
+
+### TLS Mode (Optional)
+
+Setting `ENABLE_TLS=true` enables passthrough TLS via cert-manager. This avoids the need for port-forward when creating sandboxes or running commands inside them.
+
+OpenShift HAProxy strips gRPC trailers from H2C, edge, and re-encrypt routes. Passthrough TLS preserves them end-to-end. When TLS is enabled, cert-manager creates a CA chain and the gateway serves TLS on port 8080 with mTLS for sandbox pods. The CLI connects with `--gateway-insecure` flag (self-signed CA).
+
+**TLS prerequisites:** cert-manager on the cluster. The install script auto-installs the [Red Hat cert-manager operator](https://github.com/redhat-cop/gitops-catalog/tree/main/openshift-cert-manager-operator) via OLM if CRDs are not already present. To install manually:
+```bash
+oc apply -k https://github.com/redhat-cop/gitops-catalog/openshift-cert-manager-operator/operator/overlays/stable-v1
 ```
 
 ## Using a Pre-baked Image

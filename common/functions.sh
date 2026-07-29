@@ -104,6 +104,282 @@ grant_privileged_scc() {
     oc adm policy add-scc-to-user privileged -z openshell-sandbox -n "$ns"
 }
 
+adopt_cluster_scoped_resources() {
+    local ns="$1"
+    local current_ns
+    current_ns=$(oc get clusterrole openshell-node-reader \
+        -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null || true)
+    if [ -n "$current_ns" ] && [ "$current_ns" != "$ns" ]; then
+        info "Re-annotating cluster-scoped Helm resources from $current_ns to $ns"
+        for res in clusterrole/openshell-node-reader clusterrolebinding/openshell-node-reader; do
+            oc annotate "$res" \
+                meta.helm.sh/release-name=openshell \
+                meta.helm.sh/release-namespace="$ns" --overwrite 2>/dev/null || true
+            oc label "$res" \
+                app.kubernetes.io/managed-by=Helm --overwrite 2>/dev/null || true
+        done
+    fi
+}
+
+install_cert_manager() {
+    if oc get crd certificates.cert-manager.io &>/dev/null; then
+        info "cert-manager CRDs already available"
+        return 0
+    fi
+
+    step "Install cert-manager Operator for Red Hat OpenShift"
+
+    cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager-operator
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-cert-manager-operator
+  namespace: cert-manager-operator
+spec:
+  targetNamespaces:
+    - cert-manager-operator
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-cert-manager-operator
+  namespace: cert-manager-operator
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: openshift-cert-manager-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+    info "Waiting for cert-manager operator CSV to succeed..."
+    local csv=""
+    for i in $(seq 1 30); do
+        csv=$(oc -n cert-manager-operator get csv -o name 2>/dev/null | grep cert-manager | head -1)
+        if [ -n "$csv" ]; then
+            local phase
+            phase=$(oc -n cert-manager-operator get "$csv" -o jsonpath='{.status.phase}' 2>/dev/null)
+            if [ "$phase" = "Succeeded" ]; then
+                info "cert-manager operator installed: $csv"
+                break
+            fi
+        fi
+        sleep 10
+    done
+
+    info "Waiting for cert-manager pods..."
+    oc -n cert-manager wait --for=condition=Available deployment/cert-manager --timeout=120s 2>/dev/null || true
+    oc -n cert-manager wait --for=condition=Available deployment/cert-manager-webhook --timeout=120s 2>/dev/null || true
+
+    if ! oc get crd certificates.cert-manager.io &>/dev/null; then
+        error "cert-manager CRDs still not available after install. Check operator status."
+        return 1
+    fi
+    info "cert-manager ready"
+}
+
+setup_gateway_tls() {
+    local ns="$1" apps_domain="$2"
+    local route_host="openshell-gw-${ns}.${apps_domain}"
+
+    install_cert_manager
+
+    step "Ensure auth-delegator RBAC for SA token verification"
+    if ! oc get clusterrolebinding openshell-auth-delegator &>/dev/null; then
+        oc create clusterrolebinding openshell-auth-delegator \
+            --clusterrole=system:auth-delegator \
+            --serviceaccount="${ns}:openshell"
+    else
+        local already
+        already=$(oc get clusterrolebinding openshell-auth-delegator -o json \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if any(s.get('namespace')=='$ns' and s.get('name')=='openshell' for s in d.get('subjects',[])) else 'no')" 2>/dev/null || echo "no")
+        if [ "$already" = "no" ]; then
+            oc patch clusterrolebinding openshell-auth-delegator --type='json' \
+                -p="[{\"op\":\"add\",\"path\":\"/subjects/-\",\"value\":{\"kind\":\"ServiceAccount\",\"name\":\"openshell\",\"namespace\":\"$ns\"}}]"
+        fi
+    fi
+
+    step "Create cert-manager CA chain for gateway TLS"
+
+    cat <<EOF | oc -n "$ns" apply -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: openshell-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-ca
+spec:
+  isCA: true
+  commonName: openshell-ca
+  secretName: openshell-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: openshell-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: openshell-ca-issuer
+spec:
+  ca:
+    secretName: openshell-ca-secret
+EOF
+
+    info "Waiting for CA certificate..."
+    oc -n "$ns" wait --for=condition=Ready certificate/openshell-ca --timeout=60s
+
+    cat <<EOF | oc -n "$ns" apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-server-tls
+spec:
+  secretName: openshell-tls
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - "${route_host}"
+    - "openshell.${ns}.svc.cluster.local"
+    - "openshell.${ns}.svc"
+    - "openshell"
+  issuerRef:
+    name: openshell-ca-issuer
+    kind: Issuer
+EOF
+
+    info "Waiting for server certificate..."
+    oc -n "$ns" wait --for=condition=Ready certificate/openshell-server-tls --timeout=60s
+
+    step "Create client TLS certificate for sandbox supervisor"
+    cat <<EOF | oc -n "$ns" apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-client-tls
+spec:
+  secretName: openshell-client-ca
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - client auth
+    - digital signature
+  dnsNames:
+    - "openshell-sandbox.${ns}.svc.cluster.local"
+    - "*.${ns}.svc.cluster.local"
+  issuerRef:
+    name: openshell-ca-issuer
+    kind: Issuer
+EOF
+    info "Waiting for client certificate..."
+    oc -n "$ns" wait --for=condition=Ready certificate/openshell-client-tls --timeout=60s
+
+    step "Update gateway config for TLS"
+    local oidc_block=""
+    local current_config
+    current_config=$(oc -n "$ns" get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' 2>/dev/null || true)
+    if echo "$current_config" | grep -q '\[openshell.gateway.oidc\]'; then
+        oidc_block=$(echo "$current_config" | sed -n '/\[openshell\.gateway\.oidc\]/,/^\[/{ /^\[openshell\.gateway\.oidc\]/p; /^\[/!p; }')
+    fi
+
+    local auth_line="allow_unauthenticated_users = true"
+    if [ -n "$oidc_block" ]; then
+        auth_line="allow_unauthenticated_users = true"
+    fi
+
+    cat > /tmp/gateway-tls-${ns}.toml <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address          = "0.0.0.0:8080"
+health_bind_address   = "0.0.0.0:8081"
+metrics_bind_address  = "0.0.0.0:9090"
+log_level             = "info"
+sandbox_namespace     = "${ns}"
+default_image         = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+disable_tls           = false
+enable_loopback_service_http = true
+client_tls_secret_name = "openshell-client-ca"
+
+[openshell.gateway.tls]
+cert_path = "/etc/openshell-tls/tls.crt"
+key_path  = "/etc/openshell-tls/tls.key"
+
+[openshell.gateway.auth]
+${auth_line}
+
+${oidc_block}
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/etc/openshell-jwt/signing.pem"
+public_key_path  = "/etc/openshell-jwt/public.pem"
+kid_path         = "/etc/openshell-jwt/kid"
+gateway_id       = "openshell"
+ttl_secs         = 3600
+
+[openshell.drivers.kubernetes]
+grpc_endpoint                = "https://openshell.${ns}.svc.cluster.local:8080"
+service_account_name         = "openshell-sandbox"
+supervisor_sideload_method   = "init-container"
+topology                     = "combined"
+sa_token_ttl_secs            = 3600
+app_armor_profile            = "Unconfined"
+EOF
+
+    oc create configmap openshell-config \
+        --from-file=gateway.toml="/tmp/gateway-tls-${ns}.toml" \
+        -n "$ns" --dry-run=client -o yaml | oc apply -f -
+
+    step "Mount TLS secret into gateway pod"
+    local has_tls_vol
+    has_tls_vol=$(oc -n "$ns" get statefulset openshell -o json \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if any(v['name']=='openshell-tls' for v in d['spec']['template']['spec'].get('volumes',[])) else 'no')" 2>/dev/null || echo "no")
+
+    if [ "$has_tls_vol" = "no" ]; then
+        oc patch statefulset openshell -n "$ns" --type='json' -p='[
+          {"op":"add","path":"/spec/template/spec/volumes/-",
+           "value":{"name":"openshell-tls","secret":{"secretName":"openshell-tls","defaultMode":256}}},
+          {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-",
+           "value":{"name":"openshell-tls","mountPath":"/etc/openshell-tls","readOnly":true}}
+        ]'
+    fi
+
+    step "Restart gateway with TLS"
+    oc delete pod openshell-0 -n "$ns"
+    oc rollout status statefulset/openshell -n "$ns" --timeout=120s
+
+    step "Replace route with passthrough TLS"
+    oc -n "$ns" delete route openshell-gw 2>/dev/null || true
+    oc create route passthrough openshell-gw \
+        --service=openshell --port=8080 \
+        --hostname="$route_host" -n "$ns"
+
+    info "Gateway TLS enabled at https://$route_host"
+    info "CLI: openshell gateway add --gateway-insecure https://$route_host --local --name $ns"
+    rm -f "/tmp/gateway-tls-${ns}.toml"
+}
+
 render_policy() {
     local template="$1" output="$2" domain="$3"
     if [ ! -f "$template" ]; then

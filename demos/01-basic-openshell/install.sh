@@ -39,6 +39,7 @@ step "Step 4/7: Create JWT signing secret"
 create_jwt_secret "$NAMESPACE"
 
 # Step 5: Helm install
+adopt_cluster_scoped_resources "$NAMESPACE"
 step "Step 5/7: Install OpenShell Helm chart"
 # shellcheck disable=SC2086
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -60,17 +61,29 @@ oc -n "$NAMESPACE" apply -f "$SCRIPT_DIR/manifests/route.yaml"
 sleep 2
 GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
 
+if [ "${ENABLE_TLS:-false}" = "true" ]; then
+    step "Enable passthrough TLS (cert-manager)"
+    APPS_DOMAIN=$(detect_apps_domain)
+    setup_gateway_tls "$NAMESPACE" "$APPS_DOMAIN"
+    GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
+    GW_PROTO="https"
+    GW_INSECURE_FLAG="--gateway-insecure"
+else
+    GW_PROTO="http"
+    GW_INSECURE_FLAG=""
+fi
+
 echo ""
 echo "============================================"
 echo " Setup complete!"
 echo "============================================"
 echo ""
-echo " Gateway URL: http://$GW_ROUTE"
+echo " Gateway URL: ${GW_PROTO}://$GW_ROUTE"
 echo ""
 echo " Next steps:"
 echo ""
 echo "   1. Register gateway with CLI:"
-echo "      openshell gateway add http://$GW_ROUTE --local --name openshift"
+echo "      openshell gateway add ${GW_PROTO}://$GW_ROUTE $GW_INSECURE_FLAG --local --name openshift"
 echo ""
 echo "   2. Check status:"
 echo "      openshell status"

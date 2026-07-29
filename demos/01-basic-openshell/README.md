@@ -48,10 +48,34 @@ openshell --version
 ## Quick Start (Automated)
 
 ```bash
+# Default (HTTP, uses port-forward for sandbox operations)
 bash install.sh
+
+# With TLS (passthrough route, no port-forward needed)
+ENABLE_TLS=true bash install.sh
 ```
 
-This runs all 7 steps below automatically. Continue reading for the manual walkthrough.
+This runs all steps below automatically. Continue reading for the manual walkthrough.
+
+### TLS Mode (Optional)
+
+By default the gateway runs without TLS, and sandbox operations (create, exec, connect) go through `oc port-forward` to avoid gRPC trailer issues with OpenShift routes.
+
+Setting `ENABLE_TLS=true` enables passthrough TLS via cert-manager:
+
+- cert-manager creates a CA chain (SelfSigned -> CA Certificate -> CA Issuer -> Server/Client Certs)
+- Gateway serves TLS on port 8080
+- Route becomes passthrough (preserves gRPC trailers end-to-end)
+- Sandbox pods get a client TLS cert for mTLS with the gateway
+- CLI connects with `--gateway-insecure` flag (self-signed CA)
+
+**Why:** OpenShift HAProxy strips gRPC trailers from H2C, edge, and re-encrypt routes. Passthrough TLS is the only route type that preserves them. Without TLS, you need port-forward.
+
+**TLS prerequisites:**
+- cert-manager on the cluster. The install script auto-installs the [Red Hat cert-manager operator](https://github.com/redhat-cop/gitops-catalog/tree/main/openshift-cert-manager-operator) via OLM if CRDs are not already present. To install manually:
+  ```bash
+  oc apply -k https://github.com/redhat-cop/gitops-catalog/openshift-cert-manager-operator/operator/overlays/stable-v1
+  ```
 
 ## Step-by-Step Guide
 

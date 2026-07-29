@@ -39,6 +39,7 @@ step "Step 4/10: Create JWT signing secret"
 create_jwt_secret "$NAMESPACE"
 
 # Step 5: Helm install
+adopt_cluster_scoped_resources "$NAMESPACE"
 step "Step 5/10: Install OpenShell Helm chart"
 # shellcheck disable=SC2086
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -84,12 +85,26 @@ wait_for_rollout deployment ctf-ui "$NAMESPACE" 120
 GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
 CTF_ROUTE=$(oc -n "$NAMESPACE" get route ctf-ui -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
 
+if [ "${ENABLE_TLS:-false}" = "true" ]; then
+    step "Enable passthrough TLS (cert-manager)"
+    APPS_DOMAIN=$(detect_apps_domain)
+    setup_gateway_tls "$NAMESPACE" "$APPS_DOMAIN"
+    GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
+    GW_PROTO="https"
+    oc -n "$NAMESPACE" set env deployment/ctf-ui \
+        OPENSHELL_GATEWAY_ENDPOINT="https://openshell.${NAMESPACE}.svc.cluster.local:8080" \
+        OPENSHELL_GATEWAY_INSECURE=true
+    wait_for_rollout deployment ctf-ui "$NAMESPACE" 60
+else
+    GW_PROTO="http"
+fi
+
 echo ""
 echo "============================================"
 echo " Setup complete!"
 echo "============================================"
 echo ""
-echo " Gateway URL:  http://$GW_ROUTE"
+echo " Gateway URL:  ${GW_PROTO}://$GW_ROUTE"
 echo " CTF UI URL:   https://$CTF_ROUTE"
 echo ""
 echo " Next steps:"

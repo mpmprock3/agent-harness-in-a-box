@@ -62,6 +62,7 @@ grant_privileged_scc "$NAMESPACE"
 step "Create JWT signing secret"
 create_jwt_secret "$NAMESPACE"
 
+adopt_cluster_scoped_resources "$NAMESPACE"
 step "Install OpenShell Helm chart with Keycloak OIDC"
 # shellcheck disable=SC2086
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -76,6 +77,18 @@ oc -n "$NAMESPACE" apply -f "$SCRIPT_DIR/manifests/openshell/route.yaml"
 sleep 2
 GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
 
+if [ "${ENABLE_TLS:-false}" = "true" ]; then
+    step "Enable passthrough TLS (cert-manager)"
+    APPS_DOMAIN=$(detect_apps_domain)
+    setup_gateway_tls "$NAMESPACE" "$APPS_DOMAIN"
+    GW_ROUTE=$(oc -n "$NAMESPACE" get route openshell-gw -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
+    GW_PROTO="https"
+    GW_INSECURE_FLAG="--gateway-insecure"
+else
+    GW_PROTO="http"
+    GW_INSECURE_FLAG=""
+fi
+
 # -- Summary --
 
 echo ""
@@ -83,7 +96,7 @@ echo "============================================"
 echo " Setup complete!"
 echo "============================================"
 echo ""
-echo " Gateway URL:   http://$GW_ROUTE"
+echo " Gateway URL:   ${GW_PROTO}://$GW_ROUTE"
 echo " Keycloak URL:  https://$KC_ROUTE"
 echo " Keycloak admin: admin / admin"
 echo ""
@@ -97,7 +110,7 @@ echo "   1. Start Keycloak port-forward (needed for CLI login):"
 echo "      oc -n $KC_NAMESPACE port-forward svc/keycloak 9090:80"
 echo ""
 echo "   2. Register gateway with OIDC:"
-echo "      openshell gateway add http://$GW_ROUTE \\"
+echo "      openshell gateway add ${GW_PROTO}://$GW_ROUTE $GW_INSECURE_FLAG \\"
 echo "          --name openshift \\"
 echo "          --oidc-issuer http://keycloak.$KC_NAMESPACE.svc.cluster.local/realms/openshell \\"
 echo "          --oidc-client-id openshell-cli"

@@ -72,6 +72,7 @@ Switch between strict and permissive policies in real-time. Watch as httpbin goe
 ```bash
 # Step 1: Deploy everything (gateway + CTF UI)
 bash install.sh
+# Or with TLS: ENABLE_TLS=true bash install.sh
 
 # Step 2: Create the CTF sandbox
 bash setup-sandbox.sh
@@ -121,6 +122,22 @@ echo "https://$CTF_URL"
 |----------|---------|---------|
 | `NAMESPACE` | `openshell-ctf` | OpenShift namespace for all resources |
 | `OPENSHELL_VERSION` | (latest) | Pin a specific Helm chart version |
+| `ENABLE_TLS` | `false` | Enable passthrough TLS via cert-manager (no port-forward needed) |
+
+### TLS Mode (Optional)
+
+By default the gateway runs without TLS. Setting `ENABLE_TLS=true` enables passthrough TLS via cert-manager, which removes the need for port-forward when running sandbox operations.
+
+```bash
+ENABLE_TLS=true bash install.sh
+```
+
+OpenShift HAProxy strips gRPC trailers from H2C, edge, and re-encrypt routes. Passthrough TLS preserves them end-to-end. When TLS is enabled, cert-manager creates a CA chain and the gateway serves TLS on port 8080 with mTLS for sandbox pods.
+
+**TLS prerequisites:** cert-manager on the cluster. The install script auto-installs the [Red Hat cert-manager operator](https://github.com/redhat-cop/gitops-catalog/tree/main/openshift-cert-manager-operator) via OLM if CRDs are not already present. To install manually:
+```bash
+oc apply -k https://github.com/redhat-cop/gitops-catalog/openshift-cert-manager-operator/operator/overlays/stable-v1
+```
 
 ## How the UI Works
 

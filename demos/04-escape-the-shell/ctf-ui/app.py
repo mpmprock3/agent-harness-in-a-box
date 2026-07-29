@@ -209,6 +209,14 @@ def run_unprotected(command: str) -> dict:
         }
 
 
+CLI_NOISE_RE = re.compile(
+    r"(TLS certificate verification is disabled|"
+    r"Using sandbox|"
+    r"openshell_cli::tls|"
+    r"WARN openshell)",
+)
+
+
 def run_protected(command: str) -> dict:
     start = time.monotonic()
     try:
@@ -227,11 +235,15 @@ def run_protected(command: str) -> dict:
         stderr = strip_ansi(result.stderr.strip())
         stdout_lines = [
             line for line in stdout.splitlines()
-            if "Using sandbox" not in line
+            if not CLI_NOISE_RE.search(line)
+        ]
+        stderr_lines = [
+            line for line in stderr.splitlines()
+            if not CLI_NOISE_RE.search(line)
         ]
         return {
             "stdout": "\n".join(stdout_lines),
-            "stderr": stderr,
+            "stderr": "\n".join(stderr_lines),
             "exit_code": result.returncode,
             "duration_ms": duration,
         }
