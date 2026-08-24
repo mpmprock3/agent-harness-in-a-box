@@ -511,6 +511,101 @@ bash test-sandbox-security.sh      # run all tests, see color-coded report
 
 This runs network allowlisting, L7 inspection, Landlock, and process isolation tests.
 
+## Remote Infrastructure Management via Jumpbox
+
+For enterprise deployments, the AI agent (OpenCode) runs in an isolated sandbox on a central OCP cluster but needs to provision and manage infrastructure on AWS — ROSA clusters, OpenShift AI, and model serving. A jumpbox (RHEL server on AWS) bridges this gap via SSH.
+
+### Architecture
+
+```
+  Users ──► OpenShell (Central OCP) ──► OpenCode Sandbox
+              (Keycloak OIDC)              │
+                                           │ SSH (port 22)
+                                           ▼
+                                    Jumpbox (RHEL on AWS)
+                                      ├── rosa CLI + AWS creds
+                                      ├── oc CLI + kubeconfigs
+                                      └── aws CLI
+                                           │
+                        ┌──────────────────┼──────────────────┐
+                        ▼                  ▼                  ▼
+                   ROSA Cluster      OpenShift AI         MaaS (vLLM)
+```
+
+**How it works:**
+
+1. OpenCode loads skills from a GitHub repo cloned into `/workspace/skills/`
+2. Skills contain step-by-step instructions with CLI commands (`rosa create cluster`, `oc apply`, etc.)
+3. A system instruction tells OpenCode to wrap all infrastructure commands via SSH to the jumpbox
+4. The jumpbox has AWS credentials and cluster kubeconfigs — these never enter the sandbox
+5. Network policy allows SSH only to the jumpbox IP — no other outbound SSH
+
+### Setup
+
+After running `setup-sandbox.sh`, configure jumpbox access:
+
+```bash
+# Set jumpbox connection details
+export JUMPBOX_HOST=ec2-x-x-x-x.compute.amazonaws.com
+export JUMPBOX_USER=ec2-user
+export JUMPBOX_KEY_PATH=~/.ssh/jumpbox.pem
+
+# Must be set for openshell CLI
+export OPENSHELL_GATEWAY_INSECURE=true
+
+# Configure SSH, clone skills, upload instructions
+bash setup-jumpbox-ssh.sh opencode-demo
+```
+
+The setup script:
+- Uploads your SSH private key to `/sandbox/.ssh/jumpbox_key`
+- Sets `JUMPBOX_HOST` and `JUMPBOX_USER` in the sandbox's `.profile`
+- Clones the skills repo to `/workspace/skills/`
+- Uploads jumpbox instructions to `/workspace/.opencode/instructions.md`
+- Tests SSH connectivity
+
+### Network Policy
+
+The network policy must allow SSH to the jumpbox. Set `JUMPBOX_HOST` in `.env` before running `setup-sandbox.sh`, and the policy template renders it automatically. Or update the policy after the fact:
+
+```bash
+export OPENSHELL_GATEWAY_INSECURE=true
+openshell policy set --policy /tmp/policy-standard-rendered.yaml --wait opencode-demo
+```
+
+### Usage
+
+Connect to the sandbox and use natural language:
+
+```bash
+openshell sandbox connect opencode-demo
+opencode
+```
+
+Example prompts:
+- "Create a ROSA cluster called dev-trading in us-east-1 with 2 worker nodes"
+- "Install OpenShift AI on dev-trading with GPU support"
+- "Deploy the granite-3.1-2b model as a service with a chat UI"
+- "Hibernate the dev-trading cluster to save costs"
+
+OpenCode reads the relevant skill from `/workspace/skills/`, wraps each command via SSH to the jumpbox, and streams the output back to you.
+
+### Skills Repository
+
+Skills are stored externally at [github.com/mpmprock3/ai-platform-skills](https://github.com/mpmprock3/ai-platform-skills) and cloned into the sandbox at setup time. Each skill has a `SKILL.md` with step-by-step instructions:
+
+| Skill | What it does |
+|-------|-------------|
+| `rosa-install` | Create, manage, hibernate, resume, and teardown ROSA clusters |
+| `openshift-ai-install` | Install RHOAI operators, GPU support, NFD, MaaS gateway |
+| `maas-configure` | Deploy LLM models with vLLM, subscriptions, rate limiting, chat UI |
+
+To use a different skills repo:
+
+```bash
+SKILLS_REPO=https://github.com/your-org/your-skills.git bash setup-jumpbox-ssh.sh
+```
+
 ## Teardown
 
 Remove everything:
