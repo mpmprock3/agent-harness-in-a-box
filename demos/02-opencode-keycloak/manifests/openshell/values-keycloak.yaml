@@ -1,10 +1,8 @@
 # OpenShell Helm values for Keycloak OIDC on OpenShift.
 #
-# The OIDC issuer uses the in-cluster service hostname. Tokens carry this
-# hostname as the `iss` claim regardless of how they were obtained.
-#
-# For CLI login, keep a port-forward running:
-#   oc -n openshell-keycloak port-forward svc/keycloak 9090:80
+# The OIDC issuer must use the EXTERNAL Keycloak route hostname so that both
+# the gateway (in-cluster) and the CLI (your workstation) can reach it.
+# Update the issuer URL below to match your cluster's Keycloak route.
 
 # OpenShift-specific overrides
 pkiInitJob:
@@ -17,10 +15,14 @@ securityContext:
   runAsUser: null
 
 server:
-  disableTls: true
+  disableTls: false
+  tls:
+    certSecretName: openshell-tls
+    clientCaSecretName: openshell-client-ca
+    clientTlsSecretName: openshell-client-ca
 
   oidc:
-    issuer: "http://keycloak.openshell-keycloak.svc.cluster.local/realms/openshell"
+    issuer: "https://keycloak-openshell-keycloak.apps.your-cluster.example.com/realms/openshell"
     audience: "openshell-cli"
     jwksTtl: 60
     rolesClaim: "realm_access.roles"

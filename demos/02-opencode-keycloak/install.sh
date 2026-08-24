@@ -70,6 +70,11 @@ helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
     $VERSION_FLAG \
     -f "$SCRIPT_DIR/manifests/openshell/values-keycloak.yaml"
 
+# OpenShift assigns an arbitrary UID with no home directory. The gateway
+# writes credential-key state under $HOME/.local/state; point HOME at the
+# existing writable PVC mount so that directory can be created.
+oc -n "$NAMESPACE" set env statefulset/openshell HOME=/var/openshell
+
 wait_for_rollout statefulset openshell "$NAMESPACE" 300
 
 step "Expose gateway via Route"
@@ -106,18 +111,20 @@ echo "   user@test  / user   (roles: openshell-user)"
 echo ""
 echo " Next steps:"
 echo ""
-echo "   1. Start Keycloak port-forward (needed for CLI login):"
-echo "      oc -n $KC_NAMESPACE port-forward svc/keycloak 9090:80"
+if [ "${ENABLE_TLS:-false}" = "true" ]; then
+echo "   0. Set the insecure flag (self-signed TLS certs):"
+echo "      export OPENSHELL_GATEWAY_INSECURE=true"
 echo ""
-echo "   2. Register gateway with OIDC:"
+fi
+echo "   1. Register gateway with OIDC (uses external Keycloak route):"
 echo "      openshell gateway add ${GW_PROTO}://$GW_ROUTE $GW_INSECURE_FLAG \\"
 echo "          --name openshift \\"
-echo "          --oidc-issuer http://keycloak.$KC_NAMESPACE.svc.cluster.local/realms/openshell \\"
+echo "          --oidc-issuer https://$KC_ROUTE/realms/openshell \\"
 echo "          --oidc-client-id openshell-cli"
 echo ""
-echo "   3. Login:"
+echo "   2. Login:"
 echo "      openshell gateway login openshift"
 echo ""
-echo "   4. Create a sandbox:"
-echo "      openshell sandbox create --name test -- echo 'Hello from OpenShell!'"
+echo "   3. Create a sandbox:"
+echo "      bash setup-sandbox.sh"
 echo ""

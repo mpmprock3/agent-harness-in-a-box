@@ -54,33 +54,62 @@ The original openshell-demo uses Dex as an OIDC bridge for GitHub OAuth. Keycloa
 - `openshell` CLI installed
 - `podman` or `docker` for building the sandbox image (optional if using pre-built images)
 
+## OpenShift-Specific Considerations
+
+Deploying on OpenShift requires several adjustments compared to vanilla Kubernetes or local Docker. These are already integrated into the scripts and manifests in this repo, but understanding them helps with debugging:
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| Gateway crashes with `failed to create /.local/state/` | OpenShift assigns arbitrary UIDs with no home directory | Set `HOME=/var/openshell` env var on the StatefulSet |
+| CLI can't do OIDC discovery | `KC_HOSTNAME` uses in-cluster hostname unreachable from your Mac | Set `KC_HOSTNAME` to the external Keycloak route hostname |
+| Gateway pod stuck in `ContainerCreating` | Chart expects TLS secrets named `openshell-server-tls` but cert-manager creates `openshell-tls` | Set `tls.certSecretName` and `tls.clientCaSecretName` in values |
+| `HTTP/2 was not negotiated` | Edge TLS route breaks gRPC ALPN negotiation | Use `termination: passthrough` on the route |
+| `forbidden: policy denied` in OpenCode | OpenCode binary registers as `/usr/local/bin/opencode` in `/proc/PID/exe`; supervisor proxy enforces binary-aware policy | Add `{ path: /usr/local/bin/opencode }` to network policy binaries |
+| OpenCode hits placeholder URL | `.env` has example values; `setup-sandbox.sh` bakes them into the sandbox config | Fill in `.env` with real values **before** running `setup-sandbox.sh` |
+
 ## Quick Start (Automated)
 
 ```bash
-# Default (HTTP, uses port-forward for sandbox operations)
-bash install.sh
-bash verify.sh          # check all components
-bash setup-sandbox.sh   # create sandbox with LiteLLM + MLflow
+# 1. Fill in your credentials FIRST
+cp ../../.env.example ../../.env
+# Edit .env with your actual LiteLLM endpoint, API key, and cluster domain
 
-# With TLS (passthrough route, no port-forward needed)
+# 2. Deploy infrastructure
 ENABLE_TLS=true bash install.sh
-bash verify.sh
+
+# 3. Register the gateway with your CLI
+export OPENSHELL_GATEWAY_INSECURE=true
+KC_ROUTE=$(oc -n openshell-keycloak get route keycloak -o jsonpath='{.spec.host}')
+GW_ROUTE=$(oc -n openshell get route openshell-gw -o jsonpath='{.spec.host}')
+
+openshell gateway add "https://$GW_ROUTE" \
+    --name openshift \
+    --gateway-insecure \
+    --oidc-issuer "https://$KC_ROUTE/realms/openshell" \
+    --oidc-client-id openshell-cli
+
+# 4. Login (opens browser to Keycloak — use admin@test / admin)
+openshell gateway login openshift
+
+# 5. Create sandbox
+export OPENSHELL_GATEWAY_INSECURE=true
 bash setup-sandbox.sh
+
+# 6. Connect and use OpenCode
+openshell sandbox connect opencode-demo
+# Inside sandbox: opencode
 ```
 
-This runs all steps below automatically. Continue reading for the manual walkthrough.
+### TLS Mode
 
-### TLS Mode (Optional)
-
-Setting `ENABLE_TLS=true` enables passthrough TLS via cert-manager. This avoids the need for port-forward when creating sandboxes or running commands inside them.
-
-OpenShift HAProxy strips gRPC trailers from H2C, edge, and re-encrypt routes. Passthrough TLS is the only route type that preserves gRPC trailers, so without TLS you need port-forward for sandbox operations.
+TLS is **required** for OpenShift because OpenShift HAProxy strips gRPC trailers from H2C, edge, and re-encrypt routes. Passthrough TLS is the only route type that preserves gRPC trailers.
 
 When TLS is enabled:
 - cert-manager creates a CA chain (SelfSigned -> CA Certificate -> CA Issuer -> Server/Client Certs)
 - Gateway serves TLS on port 8080 with a passthrough route
 - Sandbox pods get a client TLS cert for mTLS with the gateway
 - CLI connects with `--gateway-insecure` flag (self-signed CA)
+- Set `export OPENSHELL_GATEWAY_INSECURE=true` in your shell for all `openshell` CLI commands
 
 **TLS prerequisites:**
 - cert-manager on the cluster. The install script auto-installs the [Red Hat cert-manager operator](https://github.com/redhat-cop/gitops-catalog/tree/main/openshift-cert-manager-operator) via OLM if CRDs are not already present. To install manually:
@@ -117,7 +146,9 @@ oc -n openshell-keycloak rollout status deployment/keycloak --timeout=120s
 
 - Keycloak starts in `start-dev` mode (H2 in-memory database, no persistence needed for demos)
 - The `--import-realm` flag imports the realm JSON from the mounted ConfigMap
-- `KC_HOSTNAME` is set to `keycloak.openshell-keycloak.svc.cluster.local` so that tokens always carry this in-cluster hostname as the `iss` (issuer) claim, regardless of how they were obtained
+- `KC_HOSTNAME` must be set to the **external route hostname** (e.g. `keycloak-openshell-keycloak.apps.cluster-xxx.example.com`) so that tokens carry an issuer URL reachable by both the gateway (in-cluster) and the CLI (your Mac)
+
+> **Important:** Before deploying, edit `manifests/keycloak/deployment.yaml` and set `KC_HOSTNAME` to your cluster's Keycloak route hostname. The OIDC issuer URL in `manifests/openshell/values-keycloak.yaml` must match (use `https://` prefix since the route has edge TLS).
 
 **The pre-configured realm includes:**
 
@@ -208,12 +239,24 @@ fi
 
 ### Step 7: Install OpenShell with Keycloak OIDC
 
-Install using the Keycloak values overlay, which includes both OpenShift overrides and OIDC configuration:
+Before installing, update the values file for your cluster:
+
+1. Edit `manifests/openshell/values-keycloak.yaml`:
+   - Set `oidc.issuer` to `https://<your-keycloak-route>/realms/openshell`
+   - If using TLS with cert-manager, set `tls.certSecretName` and `tls.clientCaSecretName` to match the secret names cert-manager creates (typically `openshell-tls` and `openshell-client-ca`)
+
+2. Edit `manifests/keycloak/deployment.yaml`:
+   - Set `KC_HOSTNAME` to your Keycloak route hostname (must match what you used in `oidc.issuer`)
+
+Install using the Keycloak values overlay:
 
 ```bash
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
     --namespace openshell \
     -f manifests/openshell/values-keycloak.yaml
+
+# Fix for OpenShift arbitrary UIDs — gateway needs a writable HOME
+oc -n openshell set env statefulset/openshell HOME=/var/openshell
 ```
 
 Wait for the gateway:
@@ -222,45 +265,45 @@ Wait for the gateway:
 oc -n openshell rollout status statefulset/openshell --timeout=300s
 ```
 
-**What the OIDC configuration does:**
+**What the values file configures:**
 
-| Setting | Value | Purpose |
-|---------|-------|---------|
-| `oidc.issuer` | `http://keycloak.openshell-keycloak.svc.cluster.local/realms/openshell` | In-cluster Keycloak URL (tokens carry this as `iss`) |
-| `oidc.audience` | `openshell-cli` | Must match the client ID in Keycloak |
-| `oidc.rolesClaim` | `realm_access.roles` | Where Keycloak puts roles in the JWT |
-| `oidc.adminRole` | `openshell-admin` | Maps to Keycloak realm role |
-| `oidc.userRole` | `openshell-user` | Maps to Keycloak realm role |
+| Setting | Purpose |
+|---------|---------|
+| `pkiInitJob.enabled: false` | Disable PKI init job (incompatible with OpenShift SCCs) |
+| `podSecurityContext.fsGroup: null` | Let OpenShift assign the group |
+| `securityContext.runAsUser: null` | Let OpenShift assign the UID |
+| `server.disableTls: false` | Enable TLS (required for passthrough route + gRPC) |
+| `server.tls.certSecretName` | Must match cert-manager secret name |
+| `oidc.issuer` | Must use the **external** Keycloak route URL |
+| `oidc.audience` | Must match the Keycloak client ID (`openshell-cli`) |
+| `oidc.rolesClaim` | `realm_access.roles` — where Keycloak puts roles in the JWT |
 
-The gateway fetches Keycloak's JWKS (public keys) from the issuer URL inside the cluster to validate tokens. No external connectivity is needed.
+> **Why HOME=/var/openshell?** OpenShift assigns arbitrary UIDs that have no entry in `/etc/passwd` and no home directory. The gateway writes credential encryption state to `$HOME/.local/state/openshell/`. Without HOME set, it defaults to `/` which is read-only, causing a startup crash.
 
 ### Step 8: Create the gateway Route and register
+
+The route **must** use passthrough TLS termination. Edge TLS breaks gRPC's HTTP/2 ALPN negotiation:
 
 ```bash
 oc -n openshell apply -f manifests/openshell/route.yaml
 ```
 
-Register the gateway with OIDC:
+Register the gateway with OIDC. Since we use self-signed certs, set the insecure flag:
 
 ```bash
-GW_URL="http://$(oc -n openshell get route openshell-gw -o jsonpath='{.spec.host}')"
+export OPENSHELL_GATEWAY_INSECURE=true
 
-openshell gateway add "$GW_URL" \
+KC_ROUTE=$(oc -n openshell-keycloak get route keycloak -o jsonpath='{.spec.host}')
+GW_ROUTE=$(oc -n openshell get route openshell-gw -o jsonpath='{.spec.host}')
+
+openshell gateway add "https://$GW_ROUTE" \
     --name openshift \
-    --oidc-issuer "http://keycloak.openshell-keycloak.svc.cluster.local/realms/openshell" \
+    --gateway-insecure \
+    --oidc-issuer "https://$KC_ROUTE/realms/openshell" \
     --oidc-client-id "openshell-cli"
 ```
 
 **Authenticate with the gateway:**
-
-The CLI needs to reach Keycloak to perform the OIDC login. Since the issuer is an in-cluster URL, set up a port-forward:
-
-```bash
-# In a separate terminal
-oc -n openshell-keycloak port-forward svc/keycloak 9090:80
-```
-
-Then login:
 
 ```bash
 openshell gateway login openshift
@@ -271,17 +314,28 @@ This opens your browser to the Keycloak login page. Log in with `admin@test` / `
 Verify authentication works:
 
 ```bash
+export OPENSHELL_GATEWAY_INSECURE=true
 openshell status
 ```
 
+> **Note:** You must set `export OPENSHELL_GATEWAY_INSECURE=true` in every terminal session that uses the `openshell` CLI, since the gateway uses self-signed TLS certificates. Add it to your shell profile for convenience.
+
 ### Step 9: Create an OpenCode sandbox
 
-The recommended approach uses `setup-sandbox.sh`, which creates the sandbox, uploads OpenCode config, and injects LiteLLM + MLflow credentials:
+The recommended approach uses `setup-sandbox.sh`, which creates the sandbox, uploads OpenCode config, and injects LiteLLM + MLflow credentials.
+
+> **Critical:** Fill in `.env` with **real values** before running `setup-sandbox.sh`. The script bakes the LiteLLM URL and API key into the sandbox config files. If `.env` has placeholder values, OpenCode will try to connect to `your-litellm-endpoint.example.com` and fail.
 
 ```bash
 # Ensure .env exists with your credentials
 cp ../../.env.example ../../.env
-# Edit .env with your LiteLLM endpoint and API key
+# Edit .env — fill in ALL values:
+#   LITELLM_BASE_URL=https://your-actual-litellm-proxy/v1
+#   LITELLM_API_KEY=sk-your-actual-key
+#   OCP_APPS_DOMAIN=apps.your-cluster.example.com
+
+# Must be set for all openshell CLI commands with self-signed TLS
+export OPENSHELL_GATEWAY_INSECURE=true
 
 bash setup-sandbox.sh
 ```
@@ -296,7 +350,17 @@ SANDBOX_IMAGE=quay.io/rcarrata/agentic-harness-openshell:opencode-v1 \
 Connect and run OpenCode (credentials are auto-loaded from `.profile`):
 
 ```bash
+export OPENSHELL_GATEWAY_INSECURE=true
 openshell sandbox connect opencode-demo
+# Inside the sandbox, OpenCode loads credentials automatically:
+opencode
+```
+
+If you need to override the LiteLLM credentials inside the sandbox:
+
+```bash
+export OPENAI_API_KEY="sk-your-actual-key"
+export OPENAI_BASE_URL="https://your-litellm-proxy/v1"
 opencode
 ```
 
@@ -459,42 +523,111 @@ This removes both the OpenShell and Keycloak namespaces.
 
 ## Troubleshooting
 
-**"PermissionDenied" when accessing the gateway:**
+### Gateway pod crashes with `failed to create /.local/state/openshell/`
+
+OpenShift assigns arbitrary UIDs with no home directory. The gateway tries to write credential state to `$HOME/.local/state/...` but `HOME` defaults to `/` which is read-only.
+
+**Fix:**
+```bash
+oc -n openshell set env statefulset/openshell HOME=/var/openshell
+oc -n openshell delete pod openshell-0  # force restart with new env
+```
+
+### Gateway pod stuck in `ContainerCreating` — TLS secret not found
+
+When `disableTls: false`, the chart mounts TLS secrets. If cert-manager created secrets with different names than the chart defaults, the pod can't start.
+
+**Fix:** Check what secrets exist and update values:
+```bash
+oc -n openshell get secrets | grep tls
+# Then set tls.certSecretName and tls.clientCaSecretName in values-keycloak.yaml
+```
+
+### `HTTP/2 was not negotiated` when CLI connects
+
+gRPC requires HTTP/2. Edge TLS termination on OpenShift routes doesn't properly negotiate HTTP/2 ALPN for gRPC.
+
+**Fix:** The route must use passthrough TLS:
+```yaml
+spec:
+  tls:
+    termination: passthrough
+```
+
+### `OIDC discovery issuer mismatch` when registering gateway
+
+The CLI's `--oidc-issuer` URL must exactly match what Keycloak returns in its `/.well-known/openid-configuration` response.
+
+**Fix:** `KC_HOSTNAME` in the Keycloak deployment controls the issuer. Set it to the external route hostname and update `oidc.issuer` in values to match:
+```bash
+# Check what Keycloak advertises:
+KC_ROUTE=$(oc -n openshell-keycloak get route keycloak -o jsonpath='{.spec.host}')
+curl -sk "https://$KC_ROUTE/realms/openshell/.well-known/openid-configuration" | grep issuer
+```
+
+### `invalid peer certificate: UnknownIssuer` from CLI
+
+The gateway uses self-signed TLS certificates from cert-manager.
+
+**Fix:** Set the insecure flag:
+```bash
+export OPENSHELL_GATEWAY_INSECURE=true
+# Or per-command:
+openshell --gateway-insecure sandbox list
+```
+
+### `forbidden: policy denied` when using OpenCode
+
+This is the OpenShell supervisor's network proxy denying the connection. Three common causes:
+
+**1. Wrong binary path in policy**
+
+The supervisor identifies processes by their binary path from `/proc/PID/exe`. OpenCode's ELF binary registers as `/usr/local/bin/opencode` even though it's installed at `/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe`. The policy must include this path.
+
+Check the supervisor logs:
+```bash
+oc -n openshell logs default--opencode-demo -c agent | grep "Cannot access"
+```
+
+**Fix:** Add to the network policy's `binaries` section:
+```yaml
+binaries:
+  - { path: /usr/local/bin/opencode }
+```
+
+**2. No `binaries` section in policy = deny all**
+
+The network policy uses an **allowlist** model. If the `binaries` section is missing entirely, NO binary can access that endpoint (not even curl).
+
+**3. Wrong LiteLLM URL in OpenCode config**
+
+If `.env` had placeholder values when `setup-sandbox.sh` ran, the baked-in config points to `your-litellm-endpoint.example.com`.
+
+**Fix:**
+```bash
+export OPENSHELL_GATEWAY_INSECURE=true
+openshell sandbox exec --name opencode-demo -- \
+    sed -i 's|https://your-litellm-endpoint.example.com/v1|https://your-actual-url/v1|g' \
+    /sandbox/.config/opencode/opencode.jsonc
+```
+
+### Helm upgrade fails with `conflict with kubectl-client-side-apply`
+
+This happens when the ConfigMap was previously created or modified with `kubectl apply`, creating a field manager conflict with Helm's server-side apply.
+
+**Fix:**
+```bash
+oc -n openshell delete configmap openshell-config
+helm upgrade --install openshell ...  # Helm recreates it cleanly
+```
+
+### "PermissionDenied" when accessing the gateway
 
 The OIDC token does not have the required roles. Check that:
 1. The user has `openshell-admin` or `openshell-user` role in Keycloak
 2. The `rolesClaim` in Helm values matches Keycloak's token structure (`realm_access.roles`)
 
-Decode your token to inspect it:
-```bash
-# Get the token (stored locally by openshell CLI)
-openshell gateway login openshift 2>&1 | grep -i token
-```
-
-**"issuer mismatch" or token validation errors:**
-
-The `iss` claim in the JWT must exactly match the `oidc.issuer` in the Helm values. Both must use the in-cluster Keycloak service hostname:
-```
-http://keycloak.openshell-keycloak.svc.cluster.local/realms/openshell
-```
-
-If you see mismatches, check `KC_HOSTNAME` on the Keycloak deployment.
-
-**Self-signed certificate errors:**
-
-If the cluster uses self-signed ingress certificates:
-
-```bash
-# Option 1: Use insecure mode
-openshell gateway add "$GW_URL" --gateway-insecure ...
-
-# Option 2: Extract and trust the ingress CA
-oc -n openshift-ingress get secret router-certs-default \
-    -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/ingress-ca.pem
-export SSL_CERT_FILE=/tmp/ingress-ca.pem
-```
-
-**Keycloak pod not starting:**
+### Keycloak pod not starting
 
 Check the logs:
 ```bash
@@ -504,13 +637,6 @@ oc -n openshell-keycloak logs deployment/keycloak
 Common issues:
 - Realm JSON syntax error in the ConfigMap
 - Resource limits too low (Keycloak needs at least 512Mi)
-
-**Cannot reach Keycloak for CLI login:**
-
-The OIDC issuer URL points to an in-cluster hostname. You need a port-forward for the CLI to reach it:
-```bash
-oc -n openshell-keycloak port-forward svc/keycloak 9090:80
-```
 
 ## References
 

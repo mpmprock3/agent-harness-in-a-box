@@ -38,6 +38,9 @@ fi
 # Sandbox-accessible MLflow URI (external route, not internal svc)
 MLFLOW_SANDBOX_URI="https://mlflow-redhat-ods-applications.${OCP_APPS_DOMAIN}"
 
+LITELLM_HOST=$(echo "${LITELLM_BASE_URL}" | sed 's|https\?://||;s|/.*||')
+export LITELLM_HOST
+
 step "Render network policy (tier: ${POLICY_TIER:-standard})"
 POLICY_TIER="${POLICY_TIER:-standard}"
 POLICY_TEMPLATE="$SCRIPT_DIR/config/policy-${POLICY_TIER}.yaml.template"

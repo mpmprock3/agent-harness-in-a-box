@@ -5,7 +5,7 @@
 #
 # Use case: everyday coding agent work with balanced security.
 #
-# Template: replace __OCP_APPS_DOMAIN__ before applying.
+# Template: replace __OCP_APPS_DOMAIN__ and __LITELLM_HOST__ before applying.
 # Apply:  openshell policy set [--wait] <sandbox-name> --policy <rendered-file>
 # Test:   bash test-sandbox-security.sh <sandbox-name>
 
@@ -44,12 +44,7 @@ network_policies:
   litellm_maas:
     name: "LiteLLM MaaS"
     endpoints:
-      - host: "maas-rhdp.apps.maas.redhatworkshops.io"
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: full
-      - host: "*.redhatworkshops.io"
+      - host: "__LITELLM_HOST__"
         port: 443
         protocol: rest
         enforcement: enforce
@@ -59,6 +54,8 @@ network_policies:
       - { path: /usr/bin/python3 }
       - { path: "/sandbox/.uv/python/**" }
       - { path: /usr/bin/node }
+      - { path: /usr/local/bin/opencode }
+      - { path: "/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe" }
 
   npm_registry:
     name: "npm"

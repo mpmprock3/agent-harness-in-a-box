@@ -390,7 +390,8 @@ render_policy() {
         error "OCP_APPS_DOMAIN required to render policy"
         exit 1
     fi
-    sed "s/__OCP_APPS_DOMAIN__/${domain}/g" "$template" > "$output"
+    sed "s/__OCP_APPS_DOMAIN__/${domain}/g" "$template" \
+        | sed "s/__LITELLM_HOST__/${LITELLM_HOST:-litellm.example.com}/g" > "$output"
     info "Policy rendered from $(basename "$template") (domain: $domain)"
 }
 
