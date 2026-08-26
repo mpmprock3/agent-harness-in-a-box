@@ -39,7 +39,7 @@ fi
 if [ -f "$REPO_ROOT/.env" ]; then
     source "$REPO_ROOT/.env"
 fi
-LITELLM_HOST=$(echo "${LITELLM_BASE_URL:-}" | sed 's|https\?://||;s|/.*||')
+LITELLM_HOST=$(echo "${LITELLM_BASE_URL:-}" | sed -E 's|https?://||;s|/.*||')
 export LITELLM_HOST
 export JUMPBOX_HOST
 
@@ -94,6 +94,16 @@ openshell sandbox upload "$SANDBOX_NAME" \
     /workspace/.opencode/
 openshell sandbox exec --name "$SANDBOX_NAME" -- \
     mv /workspace/.opencode/jumpbox-instructions.md /workspace/.opencode/instructions.md
+
+step "Copy instructions to AGENTS.md (OpenCode 1.17+ reads from workspace root)"
+openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    cp /workspace/.opencode/instructions.md /workspace/AGENTS.md
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
+    cd /workspace
+    git add AGENTS.md 2>/dev/null
+    git commit -m "add jumpbox instructions" 2>/dev/null || true
+'
+info "Instructions available at /workspace/AGENTS.md (OpenCode 1.17+) and /workspace/.opencode/instructions.md"
 
 step "Verify skills are available"
 openshell sandbox exec --name "$SANDBOX_NAME" -- ls /workspace/skills/

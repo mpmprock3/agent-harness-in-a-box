@@ -64,7 +64,9 @@ Deploying on OpenShift requires several adjustments compared to vanilla Kubernet
 | CLI can't do OIDC discovery | `KC_HOSTNAME` uses in-cluster hostname unreachable from your Mac | Set `KC_HOSTNAME` to the external Keycloak route hostname |
 | Gateway pod stuck in `ContainerCreating` | Chart expects TLS secrets named `openshell-server-tls` but cert-manager creates `openshell-tls` | Set `tls.certSecretName` and `tls.clientCaSecretName` in values |
 | `HTTP/2 was not negotiated` | Edge TLS route breaks gRPC ALPN negotiation | Use `termination: passthrough` on the route |
-| `forbidden: policy denied` in OpenCode | OpenCode binary registers as `/usr/local/bin/opencode` in `/proc/PID/exe`; supervisor proxy enforces binary-aware policy | Add `{ path: /usr/local/bin/opencode }` to network policy binaries |
+| `forbidden: policy denied` in OpenCode | Supervisor reads `/proc/PID/exe` which resolves symlinks to the real ELF binary path | Add both `{ path: /usr/local/bin/opencode }` and the resolved path (see Troubleshooting) to network policy binaries |
+| OpenCode blank terminal | OpenCode 1.17+ requires workspace to be a git repo | `git init` in `/workspace` (setup-sandbox.sh does this automatically) |
+| OpenCode models not in `/model` | OpenCode 1.17+ reads config from `~/.config/opencode/opencode.jsonc`, not `.opencode/config.json` | Copy config to both paths (setup-sandbox.sh does this automatically) |
 | OpenCode hits placeholder URL | `.env` has example values; `setup-sandbox.sh` bakes them into the sandbox config | Fill in `.env` with real values **before** running `setup-sandbox.sh` |
 
 ## Quick Start (Automated)
@@ -132,8 +134,9 @@ This script automatically:
 - Renders the network policy with your cluster domain
 - Registers the LiteLLM provider and inference routes
 - Creates the sandbox and installs OpenCode
-- Uploads the OpenCode config to `/workspace/.opencode/config.json` with your chosen model
-- Writes `OPENAI_API_KEY` and `OPENAI_BASE_URL` to `/sandbox/.profile` (auto-loaded on connect)
+- Initializes `/workspace` as a git repo (required by OpenCode 1.17+)
+- Uploads the OpenCode config and copies it to OpenCode 1.17+ paths (`~/.config/opencode/opencode.jsonc` and `/workspace/opencode.jsonc`)
+- Writes `OPENAI_API_KEY` and `OPENAI_BASE_URL` to `/sandbox/.profile` and ensures `.bashrc` sources it
 - Installs the MLflow tracing plugin (if OCP token available)
 
 **Step 7: Connect and use**
@@ -448,13 +451,14 @@ opencode
 If you used `setup-sandbox.sh`, this is already done. For manual setup:
 
 ```bash
-openshell provider create openai \
+openshell provider create \
     --name litellm \
-    --base-url https://your-litellm-endpoint.example.com/v1 \
-    --api-key <your-api-key>
+    --type openai \
+    --credential "OPENAI_API_KEY=<your-api-key>" \
+    --config "base_url=https://your-litellm-endpoint.example.com/v1"
 
-openshell inference set --provider litellm --model gpt-oss-120b --role user
-openshell inference set --provider litellm --model llama-scout-17b --role system
+openshell inference set --provider litellm --model gpt-oss-120b --no-verify
+openshell inference set --provider litellm --model llama-scout-17b --system --no-verify
 
 openshell policy set --global --policy /tmp/policy-standard-rendered.yaml --yes
 ```
@@ -778,28 +782,50 @@ openshell --gateway-insecure sandbox list
 
 ### `forbidden: policy denied` when using OpenCode
 
-This is the OpenShell supervisor's network proxy denying the connection. Three common causes:
+This is the OpenShell supervisor's network proxy denying the connection. Four common causes:
 
-**1. Wrong binary path in policy**
+**1. Wrong binary path in policy (most common with pre-baked images)**
 
-The supervisor identifies processes by their binary path from `/proc/PID/exe`. OpenCode's ELF binary registers as `/usr/local/bin/opencode` even though it's installed at `/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe`. The policy must include this path.
+The supervisor identifies processes by reading `/proc/PID/exe`, which resolves symlinks to the real ELF binary. When symlink resolution via `/proc/PID/root/` fails (e.g., due to container filesystem access restrictions), the supervisor falls back to a **literal string comparison** of what `/proc/PID/exe` returns.
+
+For the pre-baked image (`quay.io/rcarrata/agentic-harness-openshell:opencode-v1`):
+- `/usr/local/bin/opencode` is a symlink to `../lib/node_modules/opencode-ai/bin/opencode.exe`
+- `/proc/PID/exe` resolves to `/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe`
+- The supervisor can't resolve the symlink through the container filesystem
+- So the literal path `/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe` must be in the policy
+
+For npm-installed OpenCode (not pre-baked): `/proc/PID/exe` resolves to `/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe`.
 
 Check the supervisor logs:
 ```bash
 oc -n openshell logs default--opencode-demo -c agent | grep "Cannot access"
 ```
 
-**Fix:** Add to the network policy's `binaries` section:
+**Fix:** Add ALL possible resolved paths to the network policy's `binaries` section:
 ```yaml
 binaries:
   - { path: /usr/local/bin/opencode }
+  - { path: "/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe" }
+  - { path: "/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe" }
 ```
 
-**2. No `binaries` section in policy = deny all**
+The policy template (`config/policy-standard.yaml.template`) already includes all three paths.
+
+**2. Global policy overriding per-sandbox policy**
+
+If a global policy was previously set, it blocks per-sandbox policy updates with the error: "policy is managed globally; delete global policy before sandbox policy update".
+
+**Fix:**
+```bash
+openshell policy delete --global --yes
+openshell policy set --policy /tmp/policy-standard-rendered.yaml --wait opencode-demo
+```
+
+**3. No `binaries` section in policy = deny all**
 
 The network policy uses an **allowlist** model. If the `binaries` section is missing entirely, NO binary can access that endpoint (not even curl).
 
-**3. Wrong LiteLLM URL in OpenCode config**
+**4. Wrong LiteLLM URL in OpenCode config**
 
 If `.env` had placeholder values when `setup-sandbox.sh` ran, the baked-in config points to `your-litellm-endpoint.example.com`.
 
@@ -810,6 +836,87 @@ openshell sandbox exec --name opencode-demo -- \
     sed -i 's|https://your-litellm-endpoint.example.com/v1|https://your-actual-url/v1|g' \
     /sandbox/.config/opencode/opencode.jsonc
 ```
+
+### OpenCode shows blank terminal
+
+OpenCode 1.17+ requires the workspace directory to be a git repository. Without it, the TUI renders a blank screen.
+
+**Fix:**
+```bash
+openshell sandbox exec --name opencode-demo -- bash -c '
+    cd /workspace
+    git config --global --add safe.directory /workspace
+    git init
+    git config user.email "sandbox@opencode.local"
+    git config user.name "Sandbox"
+    echo "# OpenCode Workspace" > README.md
+    git add README.md
+    git commit -m "init workspace"
+'
+```
+
+`setup-sandbox.sh` does this automatically.
+
+### OpenCode models not showing in `/model`
+
+OpenCode 1.17+ reads config from `~/.config/opencode/opencode.jsonc` and `/workspace/opencode.jsonc`, **not** from `/workspace/.opencode/config.json` (the old path).
+
+**Fix:**
+```bash
+openshell sandbox exec --name opencode-demo -- bash -c '
+    mkdir -p /sandbox/.config/opencode
+    cp /workspace/.opencode/config.json /sandbox/.config/opencode/opencode.jsonc
+    cp /workspace/.opencode/config.json /workspace/opencode.jsonc
+'
+```
+
+`setup-sandbox.sh` does this automatically.
+
+### `authentication error: no api key passed`
+
+The sandbox shell doesn't load `.profile` on connect. `openshell sandbox connect` starts a shell that reads `.bash_profile` -> `.bashrc`, but **not** `.profile`. Credentials written to `.profile` are never sourced.
+
+**Fix:**
+```bash
+openshell sandbox exec --name opencode-demo -- bash -c '
+    grep -q "source.*\.profile" /sandbox/.bashrc 2>/dev/null || \
+    echo "[ -f /sandbox/.profile ] && source /sandbox/.profile" >> /sandbox/.bashrc
+'
+```
+
+`setup-sandbox.sh` does this automatically.
+
+### OpenCode slow to start
+
+The MLflow plugin (`"plugin": ["@mlflow/opencode"]`) in the config tries to download/load on startup, which can add 30+ seconds.
+
+**Fix:** Remove the plugin line if MLflow tracing is not needed:
+```bash
+openshell sandbox exec --name opencode-demo -- bash -c '
+    sed -i "/plugin/d" /sandbox/.config/opencode/opencode.jsonc
+    sed -i "/plugin/d" /workspace/opencode.jsonc
+'
+```
+
+`setup-sandbox.sh` removes the plugin line by default. Re-add it manually if you need MLflow tracing.
+
+### OpenCode not using jumpbox API
+
+OpenCode 1.17+ reads project instructions from `AGENTS.md` in the workspace root, **not** from `/workspace/.opencode/instructions.md`.
+
+**Fix:**
+```bash
+openshell sandbox exec --name opencode-demo -- bash -c '
+    cp /workspace/.opencode/instructions.md /workspace/AGENTS.md
+    cd /workspace && git add AGENTS.md && git commit -m "add jumpbox instructions"
+'
+```
+
+`setup-jumpbox-api.sh` does this automatically.
+
+### `sed` commands fail on macOS
+
+BSD `sed` (macOS) doesn't support `\?` in basic regex. Scripts use `sed -E` (extended regex) with `?` instead for cross-platform compatibility. If you write custom scripts, use `sed -E 's|https?://||'` instead of `sed 's|https\?://||'`.
 
 ### Helm upgrade fails with `conflict with kubectl-client-side-apply`
 

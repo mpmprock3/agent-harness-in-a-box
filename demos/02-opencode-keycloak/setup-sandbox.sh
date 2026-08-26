@@ -38,7 +38,7 @@ fi
 # Sandbox-accessible MLflow URI (external route, not internal svc)
 MLFLOW_SANDBOX_URI="https://mlflow-redhat-ods-applications.${OCP_APPS_DOMAIN}"
 
-LITELLM_HOST=$(echo "${LITELLM_BASE_URL}" | sed 's|https\?://||;s|/.*||')
+LITELLM_HOST=$(echo "${LITELLM_BASE_URL}" | sed -E 's|https?://||;s|/.*||')
 export LITELLM_HOST
 
 step "Render network policy (tier: ${POLICY_TIER:-standard})"
@@ -105,6 +105,21 @@ else
     openshell sandbox exec --name "$SANDBOX_NAME" -- opencode --version
 fi
 
+step "Initialize workspace git repo (required by OpenCode)"
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
+    cd /workspace
+    if [ ! -d .git ]; then
+        git config --global --add safe.directory /workspace
+        git init
+        git config user.email "sandbox@opencode.local"
+        git config user.name "Sandbox"
+        echo "# OpenCode Workspace" > README.md
+        git add README.md
+        git commit -m "init workspace" 2>/dev/null
+    fi
+' 2>&1 | tail -3
+info "Workspace git repo ready"
+
 step "Upload OpenCode config"
 RENDERED_CONFIG="/tmp/opencode-config-rendered.json"
 sed "s|\${LITELLM_BASE_URL}|${LITELLM_BASE_URL}|g; s|\${LITELLM_MODEL}|${LITELLM_MODEL:-gpt-oss-120b}|g; s|\${LITELLM_MODEL_SMALL}|${LITELLM_MODEL_SMALL:-llama-scout-17b}|g" \
@@ -114,31 +129,66 @@ openshell sandbox exec --name "$SANDBOX_NAME" -- rm -rf /workspace/.opencode/con
 openshell sandbox upload "$SANDBOX_NAME" "$RENDERED_CONFIG" /workspace/.opencode/
 openshell sandbox exec --name "$SANDBOX_NAME" -- \
     mv /workspace/.opencode/opencode-config-rendered.json /workspace/.opencode/config.json
-info "OpenCode config uploaded to /workspace/.opencode/config.json"
+VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- head -1 /workspace/.opencode/config.json 2>&1 | grep -c '{' || true)
+if [ "$VERIFY" -ge 1 ]; then
+    info "OpenCode config uploaded to /workspace/.opencode/config.json"
+else
+    warn "Config upload may have failed — retrying via exec"
+    openshell sandbox exec --name "$SANDBOX_NAME" -- rm -rf /workspace/.opencode/config.json
+    CONFIG_CONTENT=$(cat "$RENDERED_CONFIG")
+    openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "cat > /workspace/.opencode/config.json << 'CONFIGEOF'
+${CONFIG_CONTENT}
+CONFIGEOF"
+    info "OpenCode config written via exec fallback"
+fi
+
+step "Copy config to OpenCode 1.17+ paths"
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
+    mkdir -p /sandbox/.config/opencode
+    # OpenCode 1.17+ reads opencode.jsonc from ~/.config/opencode/ and workspace root
+    cp /workspace/.opencode/config.json /sandbox/.config/opencode/opencode.jsonc 2>/dev/null
+    cp /workspace/.opencode/config.json /workspace/opencode.jsonc 2>/dev/null
+    # Remove MLflow plugin from startup (slows loading; re-add if MLflow is configured)
+    sed -i "/plugin/d" /sandbox/.config/opencode/opencode.jsonc 2>/dev/null
+    sed -i "/plugin/d" /workspace/opencode.jsonc 2>/dev/null
+'
+info "Config copied to ~/.config/opencode/opencode.jsonc and /workspace/opencode.jsonc"
 
 step "Set credentials and environment in sandbox"
-openshell sandbox exec --name "$SANDBOX_NAME" -- sh -c "
-    sed -i '/OPENAI_API_KEY/d; /OPENAI_BASE_URL/d; /MLFLOW_TRACKING/d; /MLFLOW_EXPERIMENT/d; /MLFLOW_WORKSPACE/d; /NODE_TLS_REJECT/d; /npm_config_prefix/d; /npm-global/d; /LiteLLM credentials/d; /sandbox env/d' /sandbox/.profile 2>/dev/null || true
-    cat >> /sandbox/.profile <<'PROFEOF'
-
-# LiteLLM credentials
-export OPENAI_API_KEY=\"${LITELLM_API_KEY}\"
-export OPENAI_BASE_URL=\"${LITELLM_BASE_URL}\"
-
-# RHOAI MLflow tracing
-export MLFLOW_TRACKING_URI=\"${MLFLOW_SANDBOX_URI}\"
-export MLFLOW_TRACKING_TOKEN=\"${OCP_TOKEN}\"
-export MLFLOW_TRACKING_INSECURE_TLS=\"true\"
-export MLFLOW_EXPERIMENT_NAME=\"opencode-sandbox\"
-export MLFLOW_WORKSPACE=\"${MLFLOW_WORKSPACE:-openshell}\"
-export NODE_TLS_REJECT_UNAUTHORIZED=\"0\"
-
-# OpenCode path
-export npm_config_prefix=/sandbox/.npm-global
-export PATH=\"/sandbox/.npm-global/bin:\$PATH\"
-PROFEOF
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "
+sed -i '/OPENAI_API_KEY/d; /OPENAI_BASE_URL/d; /MLFLOW_TRACKING/d; /MLFLOW_EXPERIMENT/d; /MLFLOW_WORKSPACE/d; /NODE_TLS_REJECT/d; /npm_config_prefix/d; /npm-global/d; /LiteLLM credentials/d; /sandbox env/d; /OpenCode path/d; /RHOAI MLflow/d' /sandbox/.profile 2>/dev/null
+echo '' >> /sandbox/.profile
+echo '# LiteLLM credentials' >> /sandbox/.profile
+echo 'export OPENAI_API_KEY=\"${LITELLM_API_KEY}\"' >> /sandbox/.profile
+echo 'export OPENAI_BASE_URL=\"${LITELLM_BASE_URL}\"' >> /sandbox/.profile
+echo '# RHOAI MLflow tracing' >> /sandbox/.profile
+echo 'export MLFLOW_TRACKING_URI=\"${MLFLOW_SANDBOX_URI}\"' >> /sandbox/.profile
+echo 'export MLFLOW_TRACKING_TOKEN=\"${OCP_TOKEN}\"' >> /sandbox/.profile
+echo 'export MLFLOW_TRACKING_INSECURE_TLS=\"true\"' >> /sandbox/.profile
+echo 'export MLFLOW_EXPERIMENT_NAME=\"opencode-sandbox\"' >> /sandbox/.profile
+echo 'export MLFLOW_WORKSPACE=\"${MLFLOW_WORKSPACE:-openshell}\"' >> /sandbox/.profile
+echo 'export NODE_TLS_REJECT_UNAUTHORIZED=\"0\"' >> /sandbox/.profile
+echo '# OpenCode path' >> /sandbox/.profile
+echo 'export npm_config_prefix=/sandbox/.npm-global' >> /sandbox/.profile
+echo 'export PATH=\"/sandbox/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"' >> /sandbox/.profile
 "
-info "Credentials written to /sandbox/.profile"
+VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- grep -c OPENAI_API_KEY /sandbox/.profile 2>&1 | tr -d '[:space:]' || true)
+if [ "$VERIFY" -ge 1 ] 2>/dev/null; then
+    info "Credentials written to /sandbox/.profile"
+else
+    error "Failed to write credentials to .profile"
+    exit 1
+fi
+
+step "Ensure .bashrc sources .profile (sandbox connect uses non-login shell)"
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
+    grep -q "source.*\.profile" /sandbox/.bashrc 2>/dev/null || \
+    echo "
+# Load sandbox credentials
+[ -f /sandbox/.profile ] && source /sandbox/.profile
+" >> /sandbox/.bashrc
+'
+info ".bashrc configured to source .profile"
 
 step "Install MLflow tracing plugin"
 if [ -n "$OCP_TOKEN" ]; then
