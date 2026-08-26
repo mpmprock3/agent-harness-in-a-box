@@ -1,20 +1,20 @@
 #!/bin/bash
-# Configure a sandbox with SSH access to a jumpbox and clone skill repos.
+# Configure a sandbox with HTTP API access to a jumpbox and clone skill repos.
 # Run AFTER setup-sandbox.sh has created the sandbox.
 #
-# This script dynamically updates the network policy to allow SSH to the
+# This script dynamically updates the network policy to allow HTTP to the
 # jumpbox IP, so different users can point to different jumpboxes without
 # editing the policy template.
 #
 # Usage:
-#   bash setup-jumpbox-ssh.sh [sandbox-name]
+#   bash setup-jumpbox-api.sh [sandbox-name]
 #
 # Required env vars:
-#   JUMPBOX_HOST       - Jumpbox hostname or IP (e.g., ec2-1-2-3-4.compute.amazonaws.com)
-#   JUMPBOX_USER       - SSH username (e.g., ec2-user)
-#   JUMPBOX_KEY_PATH   - Path to SSH private key on your local machine
+#   JUMPBOX_HOST       - Jumpbox hostname or IP (e.g., x.x.x.x)
+#   JUMPBOX_TOKEN      - Bearer token for jumpbox API authentication
 #
 # Optional:
+#   JUMPBOX_PORT       - API port (default: 8443)
 #   SKILLS_REPO        - Git URL for skills repo (default: https://github.com/mpmprock3/ai-platform-skills.git)
 set -euo pipefail
 
@@ -23,22 +23,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$REPO_ROOT/common/functions.sh"
 
 SANDBOX_NAME="${1:-opencode-demo}"
+JUMPBOX_PORT="${JUMPBOX_PORT:-8443}"
 SKILLS_REPO="${SKILLS_REPO:-https://github.com/mpmprock3/ai-platform-skills.git}"
 
 if [ -z "${JUMPBOX_HOST:-}" ]; then
     error "JUMPBOX_HOST not set. Export it before running this script."
     exit 1
 fi
-if [ -z "${JUMPBOX_USER:-}" ]; then
-    error "JUMPBOX_USER not set. Export it before running this script."
-    exit 1
-fi
-if [ -z "${JUMPBOX_KEY_PATH:-}" ]; then
-    error "JUMPBOX_KEY_PATH not set. Point it to your SSH private key file."
-    exit 1
-fi
-if [ ! -f "$JUMPBOX_KEY_PATH" ]; then
-    error "SSH key file not found: $JUMPBOX_KEY_PATH"
+if [ -z "${JUMPBOX_TOKEN:-}" ]; then
+    error "JUMPBOX_TOKEN not set. Export it before running this script."
     exit 1
 fi
 
@@ -50,7 +43,7 @@ LITELLM_HOST=$(echo "${LITELLM_BASE_URL:-}" | sed 's|https\?://||;s|/.*||')
 export LITELLM_HOST
 export JUMPBOX_HOST
 
-step "Re-render network policy with jumpbox SSH access"
+step "Re-render network policy with jumpbox API access"
 POLICY_TIER="${POLICY_TIER:-standard}"
 POLICY_TEMPLATE="$SCRIPT_DIR/config/policy-${POLICY_TIER}.yaml.template"
 RENDERED_POLICY="/tmp/policy-${POLICY_TIER}-rendered.yaml"
@@ -64,36 +57,29 @@ fi
 
 step "Apply updated network policy (hot-reload)"
 openshell policy set --policy "$RENDERED_POLICY" --wait "$SANDBOX_NAME"
-info "Network policy updated — SSH to $JUMPBOX_HOST:22 is now allowed"
+info "Network policy updated — HTTP to $JUMPBOX_HOST:$JUMPBOX_PORT is now allowed"
 
-step "Upload SSH private key to sandbox"
-openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /sandbox/.ssh
-openshell sandbox upload "$SANDBOX_NAME" "$JUMPBOX_KEY_PATH" /sandbox/.ssh/jumpbox_key
-openshell sandbox exec --name "$SANDBOX_NAME" -- chmod 600 /sandbox/.ssh/jumpbox_key
-
-step "Set jumpbox environment variables"
+step "Set jumpbox environment variables in sandbox"
 openshell sandbox exec --name "$SANDBOX_NAME" -- sh -c "
-    # Remove any old jumpbox config, then append fresh values
-    sed -i '/JUMPBOX_HOST/d; /JUMPBOX_USER/d; /Jumpbox SSH config/d' /sandbox/.profile 2>/dev/null || true
+    sed -i '/JUMPBOX_HOST/d; /JUMPBOX_PORT/d; /JUMPBOX_TOKEN/d; /Jumpbox API config/d' /sandbox/.profile 2>/dev/null || true
     cat >> /sandbox/.profile <<'VARS'
 
-# Jumpbox SSH config
+# Jumpbox API config
 export JUMPBOX_HOST=\"$JUMPBOX_HOST\"
-export JUMPBOX_USER=\"$JUMPBOX_USER\"
+export JUMPBOX_PORT=\"$JUMPBOX_PORT\"
+export JUMPBOX_TOKEN=\"$JUMPBOX_TOKEN\"
 VARS
 "
 
-step "Test SSH connectivity to jumpbox"
+step "Test API connectivity to jumpbox"
 RESULT=$(openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    ssh -i /sandbox/.ssh/jumpbox_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-    "${JUMPBOX_USER}@${JUMPBOX_HOST}" 'echo "OK: $(hostname)"' 2>&1 | grep -v "Using sandbox" | tail -1)
+    curl -s --max-time 10 "http://${JUMPBOX_HOST}:${JUMPBOX_PORT}/health" 2>&1 | grep -v "Using sandbox" | tail -1)
 
-if echo "$RESULT" | grep -q "^OK:"; then
-    info "SSH connectivity verified: $RESULT"
+if echo "$RESULT" | grep -q '"status"'; then
+    info "API connectivity verified: $RESULT"
 else
-    warn "SSH test failed: $RESULT"
-    warn "The policy allows SSH but the connection failed."
-    warn "Check: (1) jumpbox is running, (2) security group allows port 22, (3) SSH key is correct"
+    warn "API test failed: $RESULT"
+    warn "Check: (1) jumpbox API is running, (2) security group allows port $JUMPBOX_PORT, (3) network policy is applied"
 fi
 
 step "Clone skills repository into sandbox"
@@ -102,24 +88,27 @@ openshell sandbox exec --name "$SANDBOX_NAME" -- \
 
 step "Upload jumpbox instructions for OpenCode"
 openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode
+openshell sandbox exec --name "$SANDBOX_NAME" -- rm -f /workspace/.opencode/instructions.md
 openshell sandbox upload "$SANDBOX_NAME" \
     "$SCRIPT_DIR/config/jumpbox-instructions.md" \
-    /workspace/.opencode/instructions.md
+    /workspace/.opencode/
+openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    mv /workspace/.opencode/jumpbox-instructions.md /workspace/.opencode/instructions.md
 
 step "Verify skills are available"
 openshell sandbox exec --name "$SANDBOX_NAME" -- ls /workspace/skills/
 
 echo ""
 echo "============================================"
-echo " Jumpbox SSH configured for '$SANDBOX_NAME'"
+echo " Jumpbox API configured for '$SANDBOX_NAME'"
 echo "============================================"
 echo ""
-echo " Jumpbox:     ${JUMPBOX_USER}@${JUMPBOX_HOST}"
-echo " SSH key:     /sandbox/.ssh/jumpbox_key"
-echo " Skills:      /workspace/skills/"
+echo " Jumpbox:      http://${JUMPBOX_HOST}:${JUMPBOX_PORT}"
+echo " Auth:         Bearer token set in sandbox env"
+echo " Skills:       /workspace/skills/"
 echo " Instructions: /workspace/.opencode/instructions.md"
 echo ""
-echo " Network policy updated to allow SSH to $JUMPBOX_HOST:22"
+echo " Network policy updated to allow HTTP to $JUMPBOX_HOST:$JUMPBOX_PORT"
 echo " To change the jumpbox, re-run with a different JUMPBOX_HOST."
 echo ""
 echo " Connect and use:"

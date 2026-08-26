@@ -89,23 +89,23 @@ network_policies:
       - { path: "/sandbox/.uv/python/**" }
       - { path: /usr/local/bin/uv }
 
-  github_readonly:
-    name: "GitHub (read-only)"
+  github:
+    name: "GitHub"
     endpoints:
+      - host: "*.github.com"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
       - host: github.com
         port: 443
         protocol: rest
         enforcement: enforce
-        access: read-only
-      - host: api.github.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: read-only
+        access: full
       - host: "*.githubusercontent.com"
         port: 443
         enforcement: enforce
-        access: read-only
+        access: full
     binaries:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/git }
@@ -122,17 +122,16 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
-  jumpbox_ssh:
-    name: "Jumpbox SSH"
+  jumpbox_api:
+    name: "Jumpbox API"
     endpoints:
       - host: "__JUMPBOX_HOST__"
-        port: 22
+        port: 8443
         protocol: rest
         enforcement: enforce
         access: full
     binaries:
-      - { path: /usr/bin/ssh }
-      - { path: /usr/bin/scp }
+      - { path: /usr/bin/curl }
       - { path: /usr/bin/node }
       - { path: /usr/local/bin/opencode }
       - { path: "/sandbox/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe" }

@@ -466,19 +466,19 @@ curl https://api.anthropic.com             # -> HTTP 403 (direct AI APIs not nee
 curl https://example.com                   # -> HTTP 403 (not in policy)
 ```
 
-### L7 Inspection: Read-Only Enforcement
+### L7 Inspection
 
-GitHub is allowed but restricted to read-only access. The CONNECT proxy terminates TLS and inspects each HTTP request at Layer 7:
+The CONNECT proxy terminates TLS and inspects each HTTP request at Layer 7 against the policy:
 
 ```bash
-curl https://api.github.com/repos/NVIDIA/OpenShell    # -> HTTP 200 (GET allowed)
-curl -X POST https://api.github.com/repos/.../issues  # -> HTTP 403 (POST blocked!)
+curl https://api.github.com/repos/NVIDIA/OpenShell    # -> HTTP 200 (GitHub allowed)
+curl https://example.com                               # -> HTTP 403 (not in policy)
 ```
 
-The proxy returns a structured JSON error for blocked methods:
+The proxy returns a structured JSON error for blocked requests:
 
 ```json
-{"error": "policy_denied", "detail": "POST not permitted by read-only policy"}
+{"error": "policy_denied", "detail": "host not permitted by policy"}
 ```
 
 ### Filesystem: Landlock Enforcement
@@ -513,16 +513,18 @@ This runs network allowlisting, L7 inspection, Landlock, and process isolation t
 
 ## Remote Infrastructure Management via Jumpbox
 
-For enterprise deployments, the AI agent (OpenCode) runs in an isolated sandbox on a central OCP cluster but needs to provision and manage infrastructure on AWS — ROSA clusters, OpenShift AI, and model serving. A jumpbox (RHEL server on AWS) bridges this gap via SSH.
+For enterprise deployments, the AI agent (OpenCode) runs in an isolated sandbox on a central OCP cluster but needs to provision and manage infrastructure on AWS — ROSA clusters, OpenShift AI, and model serving. A jumpbox (RHEL server on AWS) bridges this gap via an HTTP API.
 
 ### Architecture
 
 ```
   Users ──► OpenShell (Central OCP) ──► OpenCode Sandbox
               (Keycloak OIDC)              │
-                                           │ SSH (port 22)
+                                           │ HTTP API (port 8443)
+                                           │ (through supervisor proxy)
                                            ▼
                                     Jumpbox (RHEL on AWS)
+                                      ├── HTTP API server
                                       ├── rosa CLI + AWS creds
                                       ├── oc CLI + kubeconfigs
                                       └── aws CLI
@@ -536,42 +538,91 @@ For enterprise deployments, the AI agent (OpenCode) runs in an isolated sandbox 
 
 1. OpenCode loads skills from a GitHub repo cloned into `/workspace/skills/`
 2. Skills contain step-by-step instructions with CLI commands (`rosa create cluster`, `oc apply`, etc.)
-3. A system instruction tells OpenCode to wrap all infrastructure commands via SSH to the jumpbox
+3. A system instruction tells OpenCode to wrap all infrastructure commands as HTTP API calls to the jumpbox
 4. The jumpbox has AWS credentials and cluster kubeconfigs — these never enter the sandbox
-5. Network policy allows SSH only to the jumpbox IP — no other outbound SSH
+5. Network policy allows HTTP only to the jumpbox IP — no other outbound access
+6. Bearer token authentication protects the API
 
-### Setup
+**Why HTTP instead of SSH:** The OpenShell supervisor proxy is an HTTP CONNECT proxy that does TLS interception. It cannot tunnel raw TCP protocols like SSH, and HTTPS to self-signed upstream certs gets rejected during the MitM handshake. Plain HTTP on port 8443 goes through the proxy as a regular forward-proxy request, bypassing both issues.
+
+### Jumpbox API Server Setup
+
+The jumpbox needs a lightweight HTTP API server. A Python reference implementation is provided:
+
+```bash
+# On the jumpbox (RHEL)
+cat > ~/jumpbox-api/server.py << 'EOF'
+import http.server, json, subprocess, os, sys
+PORT = 8443
+API_TOKEN = os.environ.get("API_TOKEN", "your-secure-token")
+
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, f, *a): sys.stderr.write(f"[{self.log_date_time_string()}] {f % a}\n")
+    def _send_json(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(200, {"status": "ok", "hostname": subprocess.getoutput("hostname"),
+                "tools": {"rosa": subprocess.getoutput("which rosa 2>/dev/null || echo not-found"),
+                           "oc": subprocess.getoutput("which oc 2>/dev/null || echo not-found"),
+                           "aws": subprocess.getoutput("which aws 2>/dev/null || echo not-found")}})
+            return
+        self.send_error(404)
+    def do_POST(self):
+        if self.path != "/exec": self.send_error(404); return
+        if self.headers.get("Authorization","") != f"Bearer {API_TOKEN}":
+            self._send_json(401, {"error": "Unauthorized"}); return
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        cmd = body.get("command", "")
+        if not cmd: self._send_json(400, {"error": "No command"}); return
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=body.get("timeout", 300),
+                env={**os.environ, "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"})
+            self._send_json(200, {"exit_code": r.returncode, "stdout": r.stdout, "stderr": r.stderr})
+        except subprocess.TimeoutExpired: self._send_json(200, {"exit_code": -1, "stdout": "", "stderr": "Timeout"})
+
+http.server.HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+EOF
+
+API_TOKEN="your-secure-token" nohup python3 ~/jumpbox-api/server.py &
+```
+
+Ensure the AWS security group allows inbound TCP on port 8443.
+
+### Sandbox Setup
 
 After running `setup-sandbox.sh`, configure jumpbox access:
 
 ```bash
 # Set jumpbox connection details
-export JUMPBOX_HOST=ec2-x-x-x-x.compute.amazonaws.com
-export JUMPBOX_USER=ec2-user
-export JUMPBOX_KEY_PATH=~/.ssh/jumpbox.pem
+export JUMPBOX_HOST=x.x.x.x              # jumpbox IP
+export JUMPBOX_TOKEN=your-secure-token   # API bearer token
+export JUMPBOX_PORT=8443                 # optional, default 8443
 
 # Must be set for openshell CLI
 export OPENSHELL_GATEWAY_INSECURE=true
 
-# Configure SSH, clone skills, upload instructions
-bash setup-jumpbox-ssh.sh opencode-demo
+# Configure API access, clone skills, upload instructions
+bash setup-jumpbox-api.sh opencode-demo
 ```
 
 The setup script:
-- Uploads your SSH private key to `/sandbox/.ssh/jumpbox_key`
-- Sets `JUMPBOX_HOST` and `JUMPBOX_USER` in the sandbox's `.profile`
+- Re-renders and hot-reloads the network policy with the jumpbox IP
+- Sets `JUMPBOX_HOST`, `JUMPBOX_PORT`, and `JUMPBOX_TOKEN` in the sandbox's `.profile`
 - Clones the skills repo to `/workspace/skills/`
 - Uploads jumpbox instructions to `/workspace/.opencode/instructions.md`
-- Tests SSH connectivity
+- Tests API connectivity
 
 ### Network Policy
 
-The network policy must allow SSH to the jumpbox. Set `JUMPBOX_HOST` in `.env` before running `setup-sandbox.sh`, and the policy template renders it automatically. Or update the policy after the fact:
-
-```bash
-export OPENSHELL_GATEWAY_INSECURE=true
-openshell policy set --policy /tmp/policy-standard-rendered.yaml --wait opencode-demo
-```
+The network policy allows HTTP to the jumpbox on port 8443. The `setup-jumpbox-api.sh` script handles policy rendering and hot-reload automatically. To change the jumpbox IP, re-run the script with a different `JUMPBOX_HOST`.
 
 ### Usage
 
@@ -588,7 +639,7 @@ Example prompts:
 - "Deploy the granite-3.1-2b model as a service with a chat UI"
 - "Hibernate the dev-trading cluster to save costs"
 
-OpenCode reads the relevant skill from `/workspace/skills/`, wraps each command via SSH to the jumpbox, and streams the output back to you.
+OpenCode reads the relevant skill from `/workspace/skills/`, wraps each command as an API call to the jumpbox, and streams the output back to you.
 
 ### Skills Repository
 
@@ -603,7 +654,7 @@ Skills are stored externally at [github.com/mpmprock3/ai-platform-skills](https:
 To use a different skills repo:
 
 ```bash
-SKILLS_REPO=https://github.com/your-org/your-skills.git bash setup-jumpbox-ssh.sh
+SKILLS_REPO=https://github.com/your-org/your-skills.git bash setup-jumpbox-api.sh
 ```
 
 ## Teardown
