@@ -27,6 +27,9 @@ echo ""
 
 check_prereqs
 
+APPS_DOMAIN=$(detect_apps_domain)
+KC_HOSTNAME="keycloak-${KC_NAMESPACE}.${APPS_DOMAIN}"
+
 # -- Phase 1: Keycloak --
 
 step "Phase 1: Deploy Keycloak"
@@ -34,7 +37,11 @@ step "Phase 1: Deploy Keycloak"
 info "Creating Keycloak namespace and resources..."
 oc apply -f "$SCRIPT_DIR/manifests/keycloak/namespace.yaml"
 oc apply -f "$SCRIPT_DIR/manifests/keycloak/realm-configmap.yaml"
-oc apply -f "$SCRIPT_DIR/manifests/keycloak/deployment.yaml"
+
+step "Render Keycloak deployment with cluster domain"
+sed "s|apps.your-cluster.example.com|${APPS_DOMAIN}|g" \
+    "$SCRIPT_DIR/manifests/keycloak/deployment.yaml" | oc apply -f -
+
 oc apply -f "$SCRIPT_DIR/manifests/keycloak/service.yaml"
 oc apply -f "$SCRIPT_DIR/manifests/keycloak/route.yaml"
 
@@ -64,11 +71,15 @@ create_jwt_secret "$NAMESPACE"
 
 adopt_cluster_scoped_resources "$NAMESPACE"
 step "Install OpenShell Helm chart with Keycloak OIDC"
+RENDERED_VALUES="/tmp/values-keycloak-rendered.yaml"
+sed "s|apps.your-cluster.example.com|${APPS_DOMAIN}|g" \
+    "$SCRIPT_DIR/manifests/openshell/values-keycloak.yaml" > "$RENDERED_VALUES"
+info "OIDC issuer: https://${KC_HOSTNAME}/realms/openshell"
 # shellcheck disable=SC2086
 helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
     --namespace "$NAMESPACE" \
     $VERSION_FLAG \
-    -f "$SCRIPT_DIR/manifests/openshell/values-keycloak.yaml"
+    -f "$RENDERED_VALUES"
 
 # OpenShift assigns an arbitrary UID with no home directory. The gateway
 # writes credential-key state under $HOME/.local/state; point HOME at the

@@ -69,15 +69,40 @@ Deploying on OpenShift requires several adjustments compared to vanilla Kubernet
 
 ## Quick Start (Automated)
 
+**Step 1: Configure credentials**
+
 ```bash
-# 1. Fill in your credentials FIRST
 cp ../../.env.example ../../.env
-# Edit .env with your actual LiteLLM endpoint, API key, and cluster domain
+```
 
-# 2. Deploy infrastructure
+Edit `../../.env` and fill in ALL values:
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `LITELLM_BASE_URL` | `https://your-litellm-proxy.example.com/v1` | Your LiteLLM proxy endpoint |
+| `LITELLM_API_KEY` | `sk-xxxxx` | Your LiteLLM API key |
+| `LITELLM_MODEL` | `minimax-m2` | Default model for OpenCode |
+| `LITELLM_MODEL_SMALL` | `minimax-m2` | Small model for system tasks |
+| `OCP_APPS_DOMAIN` | `apps.cluster-xxx.example.com` | Your cluster's apps domain (`oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}'`) |
+| `OCP_API` | `https://api.cluster-xxx.example.com:6443` | Your cluster API URL |
+
+**Step 2: Login to OpenShift**
+
+```bash
+oc login --token=<your-token> --server=<your-api-url>
+```
+
+**Step 3: Deploy infrastructure**
+
+The install script auto-detects your cluster domain and substitutes it into Keycloak's `KC_HOSTNAME` and the OIDC issuer URL. No manual editing of YAML files needed.
+
+```bash
 ENABLE_TLS=true bash install.sh
+```
 
-# 3. Register the gateway with your CLI
+**Step 4: Register the gateway**
+
+```bash
 export OPENSHELL_GATEWAY_INSECURE=true
 KC_ROUTE=$(oc -n openshell-keycloak get route keycloak -o jsonpath='{.spec.host}')
 GW_ROUTE=$(oc -n openshell get route openshell-gw -o jsonpath='{.spec.host}')
@@ -87,17 +112,46 @@ openshell gateway add "https://$GW_ROUTE" \
     --gateway-insecure \
     --oidc-issuer "https://$KC_ROUTE/realms/openshell" \
     --oidc-client-id openshell-cli
+```
 
-# 4. Login (opens browser to Keycloak — use admin@test / admin)
+**Step 5: Login to Keycloak**
+
+```bash
 openshell gateway login openshift
+# Browser opens — use admin@test / admin
+```
 
-# 5. Create sandbox
+**Step 6: Create sandbox and install OpenCode**
+
+```bash
 export OPENSHELL_GATEWAY_INSECURE=true
 bash setup-sandbox.sh
+```
 
-# 6. Connect and use OpenCode
+This script automatically:
+- Renders the network policy with your cluster domain
+- Registers the LiteLLM provider and inference routes
+- Creates the sandbox and installs OpenCode
+- Uploads the OpenCode config to `/workspace/.opencode/config.json` with your chosen model
+- Writes `OPENAI_API_KEY` and `OPENAI_BASE_URL` to `/sandbox/.profile` (auto-loaded on connect)
+- Installs the MLflow tracing plugin (if OCP token available)
+
+**Step 7: Connect and use**
+
+```bash
 openshell sandbox connect opencode-demo
-# Inside sandbox: opencode
+# Inside sandbox — credentials are auto-loaded:
+opencode
+# Use /model to switch between configured models
+```
+
+**Step 7b: (Optional) Configure jumpbox for remote infrastructure management**
+
+```bash
+export JUMPBOX_HOST=x.x.x.x
+export JUMPBOX_TOKEN=your-api-token
+export JUMPBOX_PORT=8443
+bash setup-jumpbox-api.sh opencode-demo
 ```
 
 ### TLS Mode

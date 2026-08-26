@@ -106,93 +106,39 @@ else
 fi
 
 step "Upload OpenCode config"
-sed "s|\${LITELLM_BASE_URL}|${LITELLM_BASE_URL}|g" "$SCRIPT_DIR/config/opencode-config.json" > /tmp/opencode.jsonc
-openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /sandbox/.config/opencode
-openshell sandbox upload "$SANDBOX_NAME" /tmp/opencode.jsonc /sandbox/.config/opencode/opencode.jsonc
+RENDERED_CONFIG="/tmp/opencode-config-rendered.json"
+sed "s|\${LITELLM_BASE_URL}|${LITELLM_BASE_URL}|g; s|\${LITELLM_MODEL}|${LITELLM_MODEL:-gpt-oss-120b}|g; s|\${LITELLM_MODEL_SMALL}|${LITELLM_MODEL_SMALL:-llama-scout-17b}|g" \
+    "$SCRIPT_DIR/config/opencode-config.json" > "$RENDERED_CONFIG"
+openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode
+openshell sandbox exec --name "$SANDBOX_NAME" -- rm -rf /workspace/.opencode/config.json
+openshell sandbox upload "$SANDBOX_NAME" "$RENDERED_CONFIG" /workspace/.opencode/
+openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    mv /workspace/.opencode/opencode-config-rendered.json /workspace/.opencode/config.json
+info "OpenCode config uploaded to /workspace/.opencode/config.json"
 
-step "Upload environment init script"
-cat > /tmp/sandbox-init.sh << INITHEADER
-#!/bin/sh
-LITELLM_API_KEY="${LITELLM_API_KEY}"
-LITELLM_BASE_URL="${LITELLM_BASE_URL}"
-MLFLOW_TRACKING_URI="${MLFLOW_SANDBOX_URI}"
-OCP_TOKEN="${OCP_TOKEN}"
-MLFLOW_WORKSPACE="${MLFLOW_WORKSPACE:-openshell}"
-INITHEADER
-cat >> /tmp/sandbox-init.sh << 'INITBODY'
+step "Set credentials and environment in sandbox"
+openshell sandbox exec --name "$SANDBOX_NAME" -- sh -c "
+    sed -i '/OPENAI_API_KEY/d; /OPENAI_BASE_URL/d; /MLFLOW_TRACKING/d; /MLFLOW_EXPERIMENT/d; /MLFLOW_WORKSPACE/d; /NODE_TLS_REJECT/d; /npm_config_prefix/d; /npm-global/d; /LiteLLM credentials/d; /sandbox env/d' /sandbox/.profile 2>/dev/null || true
+    cat >> /sandbox/.profile <<'PROFEOF'
 
-export OPENAI_API_KEY="$LITELLM_API_KEY"
-export OPENAI_BASE_URL="$LITELLM_BASE_URL"
+# LiteLLM credentials
+export OPENAI_API_KEY=\"${LITELLM_API_KEY}\"
+export OPENAI_BASE_URL=\"${LITELLM_BASE_URL}\"
 
-# Load OpenCode config (custom provider, model routing, enabled_providers)
-if [ -f /sandbox/.config/opencode/opencode.jsonc ]; then
-    export OPENCODE_CONFIG_CONTENT=$(cat /sandbox/.config/opencode/opencode.jsonc)
-fi
+# RHOAI MLflow tracing
+export MLFLOW_TRACKING_URI=\"${MLFLOW_SANDBOX_URI}\"
+export MLFLOW_TRACKING_TOKEN=\"${OCP_TOKEN}\"
+export MLFLOW_TRACKING_INSECURE_TLS=\"true\"
+export MLFLOW_EXPERIMENT_NAME=\"opencode-sandbox\"
+export MLFLOW_WORKSPACE=\"${MLFLOW_WORKSPACE:-openshell}\"
+export NODE_TLS_REJECT_UNAUTHORIZED=\"0\"
 
-# RHOAI MLflow tracing (external route, Bearer token auth)
-export MLFLOW_TRACKING_URI="$MLFLOW_TRACKING_URI"
-export MLFLOW_TRACKING_TOKEN="$OCP_TOKEN"
-export MLFLOW_TRACKING_INSECURE_TLS="true"
-export MLFLOW_EXPERIMENT_NAME="opencode-sandbox"
-export MLFLOW_WORKSPACE="$MLFLOW_WORKSPACE"
-export NODE_TLS_REJECT_UNAUTHORIZED="0"
-
+# OpenCode path
 export npm_config_prefix=/sandbox/.npm-global
-export PATH="/sandbox/.npm-global/bin:$PATH"
-
-echo ""
-echo "=== LiteLLM Model Selector ==="
-echo ""
-echo "Fetching available models..."
-
-MODELS=$(curl -s "${LITELLM_BASE_URL}/models" -H "Authorization: Bearer ${LITELLM_API_KEY}" 2>/dev/null \
-  | grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"//' | sort)
-
-if [ -z "$MODELS" ]; then
-    echo "Could not fetch models. Using default: gpt-oss-120b"
-    SELECTED="gpt-oss-120b"
-else
-    i=1
-    for m in $MODELS; do
-        echo "  $i) $m"
-        i=$((i + 1))
-    done
-    echo ""
-    printf "Select model [1]: "
-    read choice
-    if [ -z "$choice" ]; then choice=1; fi
-    i=1
-    SELECTED=""
-    for m in $MODELS; do
-        if [ "$i" = "$choice" ]; then SELECTED="$m"; break; fi
-        i=$((i + 1))
-    done
-    if [ -z "$SELECTED" ]; then
-        echo "Invalid selection. Using default: gpt-oss-120b"
-        SELECTED="gpt-oss-120b"
-    fi
-fi
-
-export OPENAI_MODEL="$SELECTED"
-echo ""
-echo "Model: $SELECTED"
-echo "Run: opencode"
-echo ""
-INITBODY
-openshell sandbox upload "$SANDBOX_NAME" /tmp/sandbox-init.sh /sandbox/.sandbox-init.sh
-
-step "Auto-source environment on login"
-openshell sandbox exec --name "$SANDBOX_NAME" -- sh -c '
-    grep -q "sandbox-init.sh" /sandbox/.profile 2>/dev/null || \
-    cat >> /sandbox/.profile << '"'"'PROFILE'"'"'
-
-# Auto-load sandbox credentials
-if [ -f /sandbox/.sandbox-init.sh ] && [ -z "$SANDBOX_ENV_LOADED" ]; then
-    . /sandbox/.sandbox-init.sh
-    export SANDBOX_ENV_LOADED=1
-fi
-PROFILE
-'
+export PATH=\"/sandbox/.npm-global/bin:\$PATH\"
+PROFEOF
+"
+info "Credentials written to /sandbox/.profile"
 
 step "Install MLflow tracing plugin"
 if [ -n "$OCP_TOKEN" ]; then
