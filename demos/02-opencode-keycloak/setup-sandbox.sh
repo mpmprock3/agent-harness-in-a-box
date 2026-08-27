@@ -166,8 +166,8 @@ echo '# OpenCode path' >> /sandbox/.profile
 echo 'export npm_config_prefix=/sandbox/.npm-global' >> /sandbox/.profile
 echo 'export PATH=\"/sandbox/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"' >> /sandbox/.profile
 "
-VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- grep -c OPENAI_API_KEY /sandbox/.profile 2>&1 | tr -d '[:space:]' || true)
-if [ "$VERIFY" -ge 1 ] 2>/dev/null; then
+VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- grep -c OPENAI_API_KEY /sandbox/.profile 2>&1 | grep -oE '^[0-9]+$' | tail -1 || true)
+if [ "${VERIFY:-0}" -ge 1 ] 2>/dev/null; then
     info "Credentials written to /sandbox/.profile"
 else
     error "Failed to write credentials to .profile"
