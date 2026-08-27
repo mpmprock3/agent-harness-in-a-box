@@ -149,7 +149,8 @@ info "Config copied to ~/.config/opencode/opencode.jsonc and /workspace/opencode
 
 step "Set credentials and environment in sandbox"
 openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "
-sed -i '/OPENAI_API_KEY/d; /OPENAI_BASE_URL/d; /MLFLOW_TRACKING/d; /MLFLOW_EXPERIMENT/d; /MLFLOW_WORKSPACE/d; /NODE_TLS_REJECT/d; /npm_config_prefix/d; /npm-global/d; /LiteLLM credentials/d; /sandbox env/d; /OpenCode path/d; /RHOAI MLflow/d' /sandbox/.profile 2>/dev/null
+touch /sandbox/.profile
+sed -i '/OPENAI_API_KEY/d; /OPENAI_BASE_URL/d; /MLFLOW_TRACKING/d; /MLFLOW_EXPERIMENT/d; /MLFLOW_WORKSPACE/d; /NODE_TLS_REJECT/d; /npm_config_prefix/d; /npm-global/d; /LiteLLM credentials/d; /sandbox env/d; /OpenCode path/d; /RHOAI MLflow/d' /sandbox/.profile 2>/dev/null || true
 echo '' >> /sandbox/.profile
 echo '# LiteLLM credentials' >> /sandbox/.profile
 echo 'export OPENAI_API_KEY=\"${LITELLM_API_KEY}\"' >> /sandbox/.profile
