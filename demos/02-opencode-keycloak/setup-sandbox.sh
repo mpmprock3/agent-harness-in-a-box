@@ -124,22 +124,15 @@ step "Upload OpenCode config"
 RENDERED_CONFIG="/tmp/opencode-config-rendered.json"
 sed "s|\${LITELLM_BASE_URL}|${LITELLM_BASE_URL}|g; s|\${LITELLM_MODEL}|${LITELLM_MODEL:-gpt-oss-120b}|g; s|\${LITELLM_MODEL_SMALL}|${LITELLM_MODEL_SMALL:-llama-scout-17b}|g" \
     "$SCRIPT_DIR/config/opencode-config.json" > "$RENDERED_CONFIG"
-openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode
-openshell sandbox exec --name "$SANDBOX_NAME" -- rm -rf /workspace/.opencode/config.json
-openshell sandbox upload "$SANDBOX_NAME" "$RENDERED_CONFIG" /workspace/.opencode/
-openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    mv /workspace/.opencode/opencode-config-rendered.json /workspace/.opencode/config.json
+openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode /sandbox/.config/opencode
+CONFIG_B64=$(base64 < "$RENDERED_CONFIG")
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "echo '${CONFIG_B64}' | base64 -d > /workspace/.opencode/config.json"
 VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- head -1 /workspace/.opencode/config.json 2>&1 | grep -c '{' || true)
 if [ "$VERIFY" -ge 1 ]; then
     info "OpenCode config uploaded to /workspace/.opencode/config.json"
 else
-    warn "Config upload may have failed — retrying via exec"
-    openshell sandbox exec --name "$SANDBOX_NAME" -- rm -rf /workspace/.opencode/config.json
-    CONFIG_CONTENT=$(cat "$RENDERED_CONFIG")
-    openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "cat > /workspace/.opencode/config.json << 'CONFIGEOF'
-${CONFIG_CONTENT}
-CONFIGEOF"
-    info "OpenCode config written via exec fallback"
+    error "Failed to write OpenCode config"
+    exit 1
 fi
 
 step "Copy config to OpenCode 1.17+ paths"
