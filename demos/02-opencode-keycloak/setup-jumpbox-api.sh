@@ -73,35 +73,44 @@ VARS
 
 step "Test API connectivity to jumpbox"
 RESULT=$(openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    curl -s --max-time 10 "http://${JUMPBOX_HOST}:${JUMPBOX_PORT}/health" 2>&1 | grep -v "Using sandbox" | tail -1)
+    curl -s --max-time 10 "http://${JUMPBOX_HOST}:${JUMPBOX_PORT}/health" 2>&1 | grep -oE '\{.*\}' | head -1 || true)
 
 if echo "$RESULT" | grep -q '"status"'; then
     info "API connectivity verified: $RESULT"
 else
-    warn "API test failed: $RESULT"
-    warn "Check: (1) jumpbox API is running, (2) security group allows port $JUMPBOX_PORT, (3) network policy is applied"
+    warn "API test returned: $RESULT"
+    warn "Check: (1) jumpbox API is running (plain HTTP, not HTTPS), (2) security group allows port $JUMPBOX_PORT, (3) network policy is applied"
+    warn "Continuing with setup — fix connectivity before using OpenCode"
 fi
 
 step "Clone skills repository into sandbox"
 openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    sh -c "rm -rf /workspace/skills; git clone $SKILLS_REPO /workspace/skills" 2>&1 | tail -3
+    bash -c "rm -rf /workspace/skills; git clone $SKILLS_REPO /workspace/skills 2>&1 | tail -1 && echo OK"
 
 step "Upload jumpbox instructions for OpenCode"
 openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode
-openshell sandbox exec --name "$SANDBOX_NAME" -- rm -f /workspace/.opencode/instructions.md
-openshell sandbox upload "$SANDBOX_NAME" \
-    "$SCRIPT_DIR/config/jumpbox-instructions.md" \
-    /workspace/.opencode/
-openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    mv /workspace/.opencode/jumpbox-instructions.md /workspace/.opencode/instructions.md
+# Upload instructions via base64 (openshell sandbox upload is unreliable)
+INSTRUCTIONS_B64=$(base64 < "$SCRIPT_DIR/config/jumpbox-instructions.md")
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "echo '${INSTRUCTIONS_B64}' | base64 -d > /workspace/.opencode/instructions.md"
+# Verify upload
+INSTR_VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- head -1 /workspace/.opencode/instructions.md 2>&1 | grep -oE '#' | wc -l || true)
+if [ "${INSTR_VERIFY:-0}" -ge 1 ]; then
+    info "Instructions uploaded to /workspace/.opencode/instructions.md"
+else
+    warn "Instructions upload may have failed — retrying via openshell upload"
+    openshell sandbox exec --name "$SANDBOX_NAME" -- rm -f /workspace/.opencode/instructions.md
+    openshell sandbox upload "$SANDBOX_NAME" "$SCRIPT_DIR/config/jumpbox-instructions.md" /workspace/.opencode/
+    openshell sandbox exec --name "$SANDBOX_NAME" -- \
+        mv /workspace/.opencode/jumpbox-instructions.md /workspace/.opencode/instructions.md 2>/dev/null || true
+fi
 
 step "Copy instructions to AGENTS.md (OpenCode 1.17+ reads from workspace root)"
 openshell sandbox exec --name "$SANDBOX_NAME" -- \
     cp /workspace/.opencode/instructions.md /workspace/AGENTS.md
 openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
     cd /workspace
-    git add AGENTS.md 2>/dev/null
-    git commit -m "add jumpbox instructions" 2>/dev/null || true
+    git add -A 2>/dev/null
+    git commit -m "add skills and jumpbox instructions" 2>/dev/null || true
 '
 info "Instructions available at /workspace/AGENTS.md (OpenCode 1.17+) and /workspace/.opencode/instructions.md"
 

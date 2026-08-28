@@ -123,12 +123,20 @@ info "Workspace git repo ready"
 step "Upload OpenCode config"
 RENDERED_CONFIG="/tmp/opencode-config-rendered.json"
 sed "s|\${LITELLM_BASE_URL}|${LITELLM_BASE_URL}|g; s|\${LITELLM_MODEL}|${LITELLM_MODEL:-gpt-oss-120b}|g; s|\${LITELLM_MODEL_SMALL}|${LITELLM_MODEL_SMALL:-llama-scout-17b}|g" \
-    "$SCRIPT_DIR/config/opencode-config.json" > "$RENDERED_CONFIG"
+    "$SCRIPT_DIR/config/opencode-config.json" | sed '/plugin/d' > "$RENDERED_CONFIG"
 openshell sandbox exec --name "$SANDBOX_NAME" -- mkdir -p /workspace/.opencode /sandbox/.config/opencode
-CONFIG_B64=$(base64 < "$RENDERED_CONFIG")
-openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "echo '${CONFIG_B64}' | base64 -d > /workspace/.opencode/config.json"
-VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- head -1 /workspace/.opencode/config.json 2>&1 | grep -c '{' || true)
-if [ "$VERIFY" -ge 1 ]; then
+
+# Write config via small base64 chunks (large base64 strings timeout through exec)
+split -b 512 "$RENDERED_CONFIG" /tmp/cfg_chunk_
+openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '> /workspace/.opencode/config.json'
+for chunk in /tmp/cfg_chunk_*; do
+    CHUNK_B64=$(base64 < "$chunk")
+    openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "echo '${CHUNK_B64}' | base64 -d >> /workspace/.opencode/config.json"
+done
+rm -f /tmp/cfg_chunk_*
+
+VERIFY=$(openshell sandbox exec --name "$SANDBOX_NAME" -- head -1 /workspace/.opencode/config.json 2>&1 | grep -oE '\{' | wc -l || true)
+if [ "${VERIFY:-0}" -ge 1 ]; then
     info "OpenCode config uploaded to /workspace/.opencode/config.json"
 else
     error "Failed to write OpenCode config"
@@ -137,13 +145,8 @@ fi
 
 step "Copy config to OpenCode 1.17+ paths"
 openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
-    mkdir -p /sandbox/.config/opencode
-    # OpenCode 1.17+ reads opencode.jsonc from ~/.config/opencode/ and workspace root
     cp /workspace/.opencode/config.json /sandbox/.config/opencode/opencode.jsonc 2>/dev/null
     cp /workspace/.opencode/config.json /workspace/opencode.jsonc 2>/dev/null
-    # Remove MLflow plugin from startup (slows loading; re-add if MLflow is configured)
-    sed -i "/plugin/d" /sandbox/.config/opencode/opencode.jsonc 2>/dev/null
-    sed -i "/plugin/d" /workspace/opencode.jsonc 2>/dev/null
 '
 info "Config copied to ~/.config/opencode/opencode.jsonc and /workspace/opencode.jsonc"
 
